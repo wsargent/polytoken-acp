@@ -63,7 +63,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Install polytoken
-        run: brew install polytoken/tap/polytoken-unstable
+        run: |
+          brew tap polytoken/tap
+          brew trust polytoken/tap
+          brew install polytoken/tap/polytoken-unstable
 
       - name: Run integration tests
         env:
