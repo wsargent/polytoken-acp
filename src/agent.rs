@@ -520,7 +520,22 @@ fn build_config_options(
 }
 
 /// Build the ACP available commands list from `polytoken print-slash-commands`.
+///
+/// Only commands that the daemon can actually execute when received as a
+/// prompt are advertised. TUI-only commands (help, refresh, quit, theme,
+/// etc.) are filtered out since they can't work over ACP.
 fn build_available_commands() -> Option<Vec<acp::AvailableCommand>> {
+    // Commands that make sense in an ACP context — the daemon can handle
+    // these when they appear in a prompt. TUI-only commands are excluded.
+    const ACP_SAFE_COMMANDS: &[&str] = &[
+        "/clear",
+        "/compact",
+        "/daemon-reload",
+        "/goal",
+        "/reset-shell",
+        "/title",
+    ];
+
     let output = std::process::Command::new("polytoken")
         .arg("print-slash-commands")
         .output()
@@ -538,6 +553,12 @@ fn build_available_commands() -> Option<Vec<acp::AvailableCommand>> {
         .iter()
         .filter_map(|cmd| {
             let canonical = cmd.get("canonical")?.as_str()?;
+
+            // Skip TUI-only commands that the daemon can't handle via ACP.
+            if !ACP_SAFE_COMMANDS.contains(&canonical) {
+                return None;
+            }
+
             let name = canonical.strip_prefix('/').unwrap_or(canonical);
             let description = cmd.get("description")?.as_str()?;
             let category = cmd.get("category")?.as_str()?;
