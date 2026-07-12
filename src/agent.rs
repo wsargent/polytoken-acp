@@ -210,8 +210,8 @@ async fn handle_new_session(
 
             // Fetch daemon state once, then build modes and config options from it.
             let daemon_state = daemon.fetch_daemon_state().await;
-            let modes = build_session_mode_state_from_value(&daemon_state);
-            let config_options = build_model_config_options(&daemon_state);
+            let mode_state = build_session_mode_state_from_value(&daemon_state);
+            let config_options = build_config_options(&daemon_state, &mode_state);
 
             state
                 .lock()
@@ -221,8 +221,8 @@ async fn handle_new_session(
 
             info!(session_id = %session_id, "New session created");
             let mut response = acp::NewSessionResponse::new(session_id);
-            if let Some(ms) = modes {
-                response = response.modes(ms);
+            if let Some(ms) = &mode_state {
+                response = response.modes(ms.clone());
             }
             if !config_options.is_empty() {
                 response = response.config_options(config_options);
@@ -270,8 +270,8 @@ async fn handle_resume_session(
     match DaemonHandle::spawn_with_session_id(&req.cwd, Some(&session_id)).await {
         Ok(daemon) => {
             let daemon_state = daemon.fetch_daemon_state().await;
-            let modes = build_session_mode_state_from_value(&daemon_state);
-            let config_options = build_model_config_options(&daemon_state);
+            let mode_state = build_session_mode_state_from_value(&daemon_state);
+            let config_options = build_config_options(&daemon_state, &mode_state);
 
             state
                 .lock()
@@ -281,8 +281,8 @@ async fn handle_resume_session(
 
             info!(session_id = %session_id, "Session resumed");
             let mut response = acp::ResumeSessionResponse::new();
-            if let Some(ms) = modes {
-                response = response.modes(ms);
+            if let Some(ms) = &mode_state {
+                response = response.modes(ms.clone());
             }
             if !config_options.is_empty() {
                 response = response.config_options(config_options);
@@ -455,14 +455,48 @@ fn build_session_mode_state_from_value(
 /// `category: "model"` to populate their model picker. Each option value is
 /// the daemon model name (`AvailableModelEntry.name`), and the label is the
 /// display label (`AvailableModelEntry.label`).
-fn build_model_config_options(
+fn build_config_options(
     state: &Result<serde_json::Value, anyhow::Error>,
+    mode_state: &Option<acp::SessionModeState>,
 ) -> Vec<acp::SessionConfigOption> {
+    let mut options = Vec::new();
+
+    // Mode config option (category=mode)
+    if let Some(ms) = mode_state {
+        let mode_options: Vec<acp::SessionConfigSelectOption> = ms
+            .available_modes
+            .iter()
+            .map(|m| {
+                acp::SessionConfigSelectOption::new(m.id.0.as_ref().to_string(), m.name.clone())
+            })
+            .collect();
+
+        if !mode_options.is_empty() {
+            let current_mode = ms.current_mode_id.0.as_ref().to_string();
+            let mode_option =
+                acp::SessionConfigOption::select("mode", "Mode", current_mode, mode_options)
+                    .category(acp::SessionConfigOptionCategory::Mode);
+            options.push(mode_option);
+        }
+    }
+
+    // Model config option (category=model)
+    if let Some(opt) = build_model_config_option(state) {
+        options.push(opt);
+    }
+
+    options
+}
+
+/// Build the model `SessionConfigOption` from the daemon's `available_models` list.
+fn build_model_config_option(
+    state: &Result<serde_json::Value, anyhow::Error>,
+) -> Option<acp::SessionConfigOption> {
     let state = match state {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "Failed to fetch daemon state for models; skipping model config");
-            return Vec::new();
+            return None;
         }
     };
 
@@ -473,11 +507,11 @@ fn build_model_config_options(
 
     let available_models = match state.get("available_models").and_then(|v| v.as_array()) {
         Some(arr) => arr,
-        None => return Vec::new(),
+        None => return None,
     };
 
     if available_models.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     let options: Vec<acp::SessionConfigSelectOption> = available_models
@@ -494,7 +528,7 @@ fn build_model_config_options(
         .collect();
 
     if options.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     // Use the first model name if active_model is empty.
@@ -504,10 +538,10 @@ fn build_model_config_options(
         active_model.to_string()
     };
 
-    let model_option = acp::SessionConfigOption::select("model", "Model", current_value, options)
-        .category(acp::SessionConfigOptionCategory::Model);
-
-    vec![model_option]
+    Some(
+        acp::SessionConfigOption::select("model", "Model", current_value, options)
+            .category(acp::SessionConfigOptionCategory::Model),
+    )
 }
 
 async fn handle_list_sessions(
@@ -598,23 +632,17 @@ async fn handle_set_session_config_option(
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
     let config_id = req.config_id.0.to_string();
-    let model_value = req.value.as_value_id().map(|v| v.0.as_ref().to_string());
+    let value = req.value.as_value_id().map(|v| v.0.as_ref().to_string());
 
     info!(
         session_id = %session_id,
         config_id = %config_id,
-        value = ?model_value,
+        value = ?value,
         "ACP set_session_config_option"
     );
 
-    // Only "model" is supported right now.
-    if config_id != "model" {
-        warn!(config_id = %config_id, "Unsupported config option; ignoring");
-        return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
-    }
-
-    let Some(model_name) = model_value else {
-        warn!("Expected value-id for model config option; ignoring");
+    let Some(value) = value else {
+        warn!("Expected value-id for config option; ignoring");
         return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
     };
 
@@ -631,40 +659,53 @@ async fn handle_set_session_config_option(
         }
     };
 
+    // Route to the appropriate daemon endpoint based on config_id.
+    let (endpoint, payload, label) = match config_id.as_str() {
+        "model" => (
+            format!("{}/model", base_url),
+            serde_json::json!({ "model": value }),
+            "model",
+        ),
+        "mode" => (
+            format!("{}/facet", base_url),
+            serde_json::json!({ "facet": value }),
+            "facet/mode",
+        ),
+        _ => {
+            warn!(config_id = %config_id, "Unsupported config option; ignoring");
+            return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
+        }
+    };
+
     let client = reqwest::Client::new();
-    let url = format!("{}/model", base_url);
     let resp = client
-        .post(&url)
+        .post(&endpoint)
         .header("Authorization", format!("Bearer {}", bearer))
-        .json(&serde_json::json!({ "model": model_name }))
+        .json(&payload)
         .send()
         .await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            info!(session_id = %session_id, model = %model_name, "Model switched");
-            // Return empty config_options — the client already knows the
-            // new value since it just set it. A follow-up session update
-            // notification with the full config_options could be sent if
-            // needed, but Paseo doesn't require it.
+            info!(session_id = %session_id, label = %label, value = %value, "Config option set");
             responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]))
         }
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
-            error!(status = %status, body = %body, "Failed to switch model");
+            error!(status = %status, body = %body, label = %label, "Failed to set config option");
             responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
                 serde_json::json!({
-                    "error": "Failed to switch model",
-                    "detail": format!("POST /model returned status {}: {}", status, body),
+                    "error": format!("Failed to set {}", label),
+                    "detail": format!("POST {} returned status {}: {}", endpoint, status, body),
                 }),
             ))
         }
         Err(e) => {
-            error!(error = %e, "Failed to POST /model");
+            error!(error = %e, label = %label, "Failed to POST");
             responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
                 serde_json::json!({
-                    "error": "Failed to switch model",
+                    "error": format!("Failed to set {}", label),
                     "detail": e.to_string(),
                 }),
             ))
