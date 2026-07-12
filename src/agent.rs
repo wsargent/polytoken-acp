@@ -504,13 +504,8 @@ fn build_model_config_options(
         active_model.to_string()
     };
 
-    let model_option = acp::SessionConfigOption::select(
-        "model",
-        "Model",
-        current_value,
-        options,
-    )
-    .category(acp::SessionConfigOptionCategory::Model);
+    let model_option = acp::SessionConfigOption::select("model", "Model", current_value, options)
+        .category(acp::SessionConfigOptionCategory::Model);
 
     vec![model_option]
 }
@@ -658,21 +653,21 @@ async fn handle_set_session_config_option(
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
             error!(status = %status, body = %body, "Failed to switch model");
-            responder.respond_with_error(
-                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({
                     "error": "Failed to switch model",
                     "detail": format!("POST /model returned status {}: {}", status, body),
-                })),
-            )
+                }),
+            ))
         }
         Err(e) => {
             error!(error = %e, "Failed to POST /model");
-            responder.respond_with_error(
-                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({
                     "error": "Failed to switch model",
                     "detail": e.to_string(),
-                })),
-            )
+                }),
+            ))
         }
     }
 }

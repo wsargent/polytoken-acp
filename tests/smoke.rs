@@ -9,7 +9,7 @@
 
 use std::process::Stdio;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -125,7 +125,9 @@ impl AcpClient {
 /// handshake before any daemon spawning happens.
 #[tokio::test]
 async fn test_initialize_capabilities() {
-    let mut client = AcpClient::spawn().await.expect("failed to spawn polytoken-acp");
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
 
     let result = client
         .request(
@@ -142,11 +144,10 @@ async fn test_initialize_capabilities() {
     assert_eq!(agent_info["name"], "polytoken");
 
     // load_session should be false
-    let caps = result.get("agentCapabilities").expect("missing agentCapabilities");
-    assert_eq!(
-        caps["loadSession"], false,
-        "loadSession should be false"
-    );
+    let caps = result
+        .get("agentCapabilities")
+        .expect("missing agentCapabilities");
+    assert_eq!(caps["loadSession"], false, "loadSession should be false");
 
     // Session capabilities: must advertise list and resume
     let session_caps = caps
@@ -195,11 +196,16 @@ async fn test_session_new() {
         return;
     }
 
-    let mut client = AcpClient::spawn().await.expect("failed to spawn polytoken-acp");
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
 
     // Initialize
     client
-        .request("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}}))
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
         .await;
 
     // Authenticate (noop method — agent returns empty auth methods)
@@ -219,7 +225,8 @@ async fn test_session_new() {
         )
         .await;
 
-    let session_id = result.get("sessionId")
+    let session_id = result
+        .get("sessionId")
         .and_then(|v| v.as_str())
         .expect("missing sessionId in session/new response");
     assert!(!session_id.is_empty(), "sessionId should not be empty");
@@ -230,15 +237,11 @@ async fn test_session_new() {
         .as_array()
         .expect("availableModes should be an array");
     assert!(
-        available_modes
-            .iter()
-            .any(|m| m["id"] == "execute"),
+        available_modes.iter().any(|m| m["id"] == "execute"),
         "modes should include execute"
     );
     assert!(
-        available_modes
-            .iter()
-            .any(|m| m["id"] == "plan"),
+        available_modes.iter().any(|m| m["id"] == "plan"),
         "modes should include plan"
     );
 
@@ -282,10 +285,7 @@ async fn test_session_new() {
         );
     }
 
-    eprintln!(
-        "session/new returned {} models",
-        options.len()
-    );
+    eprintln!("session/new returned {} models", options.len());
 
     client.kill().await;
 }
@@ -304,12 +304,17 @@ async fn test_session_resume() {
         return;
     }
 
-    let mut client = AcpClient::spawn().await.expect("failed to spawn polytoken-acp");
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
     let cwd = std::env::current_dir().unwrap();
 
     // Initialize + authenticate
     client
-        .request("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}}))
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
         .await;
     client
         .request("authenticate", json!({"methodId": "noop"}))
@@ -361,10 +366,10 @@ async fn test_session_resume() {
             Err(_) => continue,
         };
         if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
-            let err = msg.get("error").expect("expected error for duplicate resume");
-            let message = err["message"]
-                .as_str()
-                .unwrap_or("(no message)");
+            let err = msg
+                .get("error")
+                .expect("expected error for duplicate resume");
+            let message = err["message"].as_str().unwrap_or("(no message)");
             eprintln!("session/resume of existing session correctly returned error: {message}");
             break;
         }
@@ -387,12 +392,17 @@ async fn test_set_config_option() {
         return;
     }
 
-    let mut client = AcpClient::spawn().await.expect("failed to spawn polytoken-acp");
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
     let cwd = std::env::current_dir().unwrap();
 
     // Initialize + authenticate
     client
-        .request("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}}))
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
         .await;
     client
         .request("authenticate", json!({"methodId": "noop"}))
@@ -499,17 +509,19 @@ async fn test_models_match_cli() {
         "no models found in `polytoken models` output"
     );
 
-    eprintln!(
-        "CLI reports {} unique model names",
-        cli_model_names.len()
-    );
+    eprintln!("CLI reports {} unique model names", cli_model_names.len());
 
     // --- Get models from session/new configOptions ---
-    let mut client = AcpClient::spawn().await.expect("failed to spawn polytoken-acp");
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
     let cwd = std::env::current_dir().unwrap();
 
     client
-        .request("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}}))
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
         .await;
     client
         .request("authenticate", json!({"methodId": "noop"}))
@@ -588,11 +600,16 @@ async fn test_session_close() {
         return;
     }
 
-    let mut client = AcpClient::spawn().await.expect("failed to spawn polytoken-acp");
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
     let cwd = std::env::current_dir().unwrap();
 
     client
-        .request("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}}))
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
         .await;
     client
         .request("authenticate", json!({"methodId": "noop"}))
@@ -611,20 +628,14 @@ async fn test_session_close() {
 
     // Close it
     let _result = client
-        .request(
-            "session/close",
-            json!({"sessionId": &session_id}),
-        )
+        .request("session/close", json!({"sessionId": &session_id}))
         .await;
 
     eprintln!("Session closed successfully");
 
     // Closing again should still work (idempotent)
     let _result = client
-        .request(
-            "session/close",
-            json!({"sessionId": &session_id}),
-        )
+        .request("session/close", json!({"sessionId": &session_id}))
         .await;
 
     eprintln!("Second close on same session succeeded (idempotent)");
