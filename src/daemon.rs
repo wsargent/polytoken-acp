@@ -66,7 +66,22 @@ pub(crate) struct AvailableModelEntry {
 impl DaemonHandle {
     /// Spawn a new polytoken daemon for the given working directory.
     pub async fn spawn(cwd: &Path) -> Result<DaemonHandle> {
-        let session_id = generate_session_id();
+        Self::spawn_with_session_id(cwd, None).await
+    }
+
+    /// Spawn a polytoken daemon, optionally resuming an existing session by ID.
+    ///
+    /// When `resume_session_id` is `Some`, the daemon is started with the given
+    /// session ID and will load the corresponding session history from its
+    /// internal store. A fresh temp directory and credential are always
+    /// created for the daemon process itself.
+    pub async fn spawn_with_session_id(
+        cwd: &Path,
+        resume_session_id: Option<&str>,
+    ) -> Result<DaemonHandle> {
+        let session_id = resume_session_id
+            .map(|s| s.to_string())
+            .unwrap_or_else(generate_session_id);
         let temp_dir = std::env::temp_dir().join(format!("polytoken-acp-{}", session_id));
         let sessions_dir = temp_dir.join("sessions");
         let log_dir = temp_dir.join("logs");
