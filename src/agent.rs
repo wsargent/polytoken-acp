@@ -832,6 +832,19 @@ impl SseConsumer {
                         stop_reason = ?stop_reason,
                         "Prompt turn complete"
                     );
+
+                    // Send usage_update notification with context usage.
+                    if let Some(usage) = fetch_context_usage(&base_url, &bearer_token).await {
+                        let sid = acp::SessionId::new(session_id.clone());
+                        let notification = acp::SessionNotification::new(
+                            sid,
+                            acp::SessionUpdate::UsageUpdate(usage),
+                        );
+                        if let Err(e) = conn.send_notification(notification) {
+                            warn!(error = %e, "Failed to send usage_update notification");
+                        }
+                    }
+
                     return responder
                         .take()
                         .expect("responder already consumed")
@@ -1127,6 +1140,40 @@ async fn handle_ask_user_question(
 // ---------------------------------------------------------------------------
 // Daemon HTTP helpers (standalone functions for use in spawned tasks)
 // ---------------------------------------------------------------------------
+
+/// Fetch context usage from the daemon's `/state` endpoint and convert to ACP `UsageUpdate`.
+async fn fetch_context_usage(base_url: &str, bearer_token: &str) -> Option<acp::UsageUpdate> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/state", base_url);
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let state: serde_json::Value = resp.json().await.ok()?;
+    let usage = state.get("context_usage")?;
+
+    let used = usage
+        .get("used_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let size = usage
+        .get("limit_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    if size == 0 {
+        return None;
+    }
+
+    Some(acp::UsageUpdate::new(used, size))
+}
 
 async fn respond_interrogative_permission(
     base_url: &str,
