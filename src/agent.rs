@@ -193,7 +193,7 @@ async fn handle_new_session(
     state: &Arc<Mutex<AgentState>>,
     req: acp::NewSessionRequest,
     responder: agent_client_protocol::Responder<acp::NewSessionResponse>,
-    _cx: ConnectionTo<Client>,
+    cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     info!(cwd = ?req.cwd, "ACP new_session");
 
@@ -220,6 +220,24 @@ async fn handle_new_session(
                 .insert(session_id.clone(), daemon);
 
             info!(session_id = %session_id, "New session created");
+
+            // Send session_info_update with the title from the daemon state.
+            if let Ok(ref ds) = daemon_state {
+                if let Some(title) = ds.get("session_title").and_then(|v| v.as_str()) {
+                    if !title.is_empty() {
+                        let info_update = acp::SessionInfoUpdate::new().title(title.to_string());
+                        let sid = acp::SessionId::new(session_id.clone());
+                        let notification = acp::SessionNotification::new(
+                            sid,
+                            acp::SessionUpdate::SessionInfoUpdate(info_update),
+                        );
+                        if let Err(e) = cx.send_notification(notification) {
+                            warn!(error = %e, "Failed to send session_info_update notification");
+                        }
+                    }
+                }
+            }
+
             let mut response = acp::NewSessionResponse::new(session_id);
             if let Some(ms) = &mode_state {
                 response = response.modes(ms.clone());
