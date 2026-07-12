@@ -107,12 +107,47 @@ impl acp::Agent for PolytokenAgent {
             })?;
 
         let session_id = daemon.session_id().to_string();
+
+        // Fetch available models from the daemon so the ACP client (Paseo)
+        // can display a model selector — before moving the handle into the map.
+        let models = match daemon.fetch_session_state().await {
+            Ok(state) => {
+                let available: Vec<acp::ModelInfo> = state
+                    .available_models
+                    .iter()
+                    .map(|m| acp::ModelInfo::new(m.name.clone(), m.label.clone()))
+                    .collect();
+                let current = state
+                    .active_model
+                    .unwrap_or_else(|| {
+                        state
+                            .available_models
+                            .first()
+                            .map(|m| m.name.clone())
+                            .unwrap_or_default()
+                    });
+                if available.is_empty() {
+                    None
+                } else {
+                    Some(acp::SessionModelState::new(current, available))
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch session state for models; continuing without model list");
+                None
+            }
+        };
+
         self.sessions
             .borrow_mut()
             .insert(session_id.clone(), daemon);
 
-        info!(session_id = %session_id, "New session created");
-        Ok(acp::NewSessionResponse::new(session_id))
+        info!(session_id = %session_id, models = ?models.is_some(), "New session created");
+        let mut response = acp::NewSessionResponse::new(session_id);
+        if let Some(ms) = models {
+            response = response.models(ms);
+        }
+        Ok(response)
     }
 
     async fn prompt(&self, req: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
@@ -220,6 +255,38 @@ impl acp::Agent for PolytokenAgent {
         _req: acp::SetSessionConfigOptionRequest,
     ) -> acp::Result<acp::SetSessionConfigOptionResponse> {
         Ok(acp::SetSessionConfigOptionResponse::new(vec![]))
+    }
+
+    async fn set_session_model(
+        &self,
+        req: acp::SetSessionModelRequest,
+    ) -> acp::Result<acp::SetSessionModelResponse> {
+        let session_id = req.session_id.to_string();
+        let model_id = req.model_id.0.to_string();
+
+        info!(session_id = %session_id, model_id = %model_id, "ACP set_session_model");
+
+        let sessions = self.sessions.borrow();
+        let daemon = sessions.get(&session_id).ok_or_else(|| {
+            error!(session_id = %session_id, "Session not found for set_session_model");
+            acp::Error::internal_error().data(serde_json::json!({
+                "error": "Session not found"
+            }))
+        })?;
+
+        daemon
+            .set_model(&model_id)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Failed to set model on daemon");
+                acp::Error::internal_error().data(serde_json::json!({
+                    "error": "Failed to switch model",
+                    "detail": e.to_string(),
+                }))
+            })?;
+
+        info!(session_id = %session_id, model_id = %model_id, "Model switched");
+        Ok(acp::SetSessionModelResponse::new())
     }
 
     async fn ext_method(&self, _req: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {

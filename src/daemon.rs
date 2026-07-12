@@ -43,6 +43,23 @@ struct PromptAcceptedResponse {
     prompt_id: String,
 }
 
+/// Subset of the daemon's `GET /state` response (`SessionStateSnapshot`)
+/// that we need to populate the ACP model list.
+#[derive(Deserialize)]
+pub(crate) struct SessionStateSnapshot {
+    #[serde(default)]
+    pub active_model: Option<String>,
+    #[serde(default)]
+    pub available_models: Vec<AvailableModelEntry>,
+}
+
+/// One entry in the daemon's available-model list.
+#[derive(Deserialize)]
+pub(crate) struct AvailableModelEntry {
+    pub name: String,
+    pub label: String,
+}
+
 impl DaemonHandle {
     /// Spawn a new polytoken daemon for the given working directory.
     pub async fn spawn(cwd: &Path) -> Result<DaemonHandle> {
@@ -263,6 +280,41 @@ impl DaemonHandle {
             Ok(r) => Ok(r.status().is_success()),
             Err(_) => Ok(false),
         }
+    }
+
+    /// Fetch the daemon's session state snapshot (the subset we need).
+    pub async fn fetch_session_state(&self) -> Result<SessionStateSnapshot> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/state", self.base_url);
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.bearer_token))
+            .send()
+            .await
+            .context("Failed to GET /state")?;
+        if !resp.status().is_success() {
+            bail!("GET /state returned status {}", resp.status());
+        }
+        resp.json::<SessionStateSnapshot>()
+            .await
+            .context("Failed to parse /state response")
+    }
+
+    /// Switch the active model by POSTing to `/model`.
+    pub async fn set_model(&self, model_name: &str) -> Result<()> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/model", self.base_url);
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.bearer_token))
+            .json(&serde_json::json!({ "model": model_name }))
+            .send()
+            .await
+            .context("Failed to POST /model")?;
+        if !resp.status().is_success() {
+            bail!("POST /model returned status {}", resp.status());
+        }
+        Ok(())
     }
 
     /// The SSE events URL for this daemon.
