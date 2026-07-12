@@ -1,9 +1,9 @@
 //! Daemon SSE event deserialization and ACP translation.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use agent_client_protocol as acp;
+use agent_client_protocol::schema::v1 as acp;
 
 // ---------------------------------------------------------------------------
 // Daemon event types (from GET /events SSE stream)
@@ -25,12 +25,11 @@ pub struct DaemonEventEnvelope {
 /// Parse an SSE data line: unwrap the envelope, then deserialize the inner event.
 pub fn parse_sse_event(data: &str) -> Option<DaemonEvent> {
     // First try to parse as an envelope (with "event" wrapper)
-    if let Ok(envelope) = serde_json::from_str::<DaemonEventEnvelope>(data) {
-        if let Some(event_value) = envelope.event {
-            if let Ok(evt) = serde_json::from_value::<DaemonEvent>(event_value) {
-                return Some(evt);
-            }
-        }
+    if let Ok(envelope) = serde_json::from_str::<DaemonEventEnvelope>(data)
+        && let Some(event_value) = envelope.event
+        && let Ok(evt) = serde_json::from_value::<DaemonEvent>(event_value)
+    {
+        return Some(evt);
     }
     // Fallback: try parsing directly as a DaemonEvent (no envelope)
     serde_json::from_str::<DaemonEvent>(data).ok()
@@ -55,10 +54,7 @@ pub enum DaemonEvent {
         delta: BlockDeltaPayload,
     },
     #[serde(rename = "content_block_stop")]
-    ContentBlockStop {
-        prompt_id: String,
-        block_index: u32,
-    },
+    ContentBlockStop { prompt_id: String, block_index: u32 },
     #[serde(rename = "message_complete")]
     MessageComplete { prompt_id: String },
     #[serde(rename = "turn_cancelled")]
@@ -93,6 +89,7 @@ pub enum DaemonEvent {
     AskUserQuestion {
         prompt_id: String,
         interrogative_id: String,
+        payload: AskUserQuestionPayload,
     },
     #[serde(rename = "heartbeat")]
     Heartbeat,
@@ -123,11 +120,65 @@ pub enum BlockDeltaPayload {
 }
 
 // ---------------------------------------------------------------------------
+// ask_user_question payload types (from daemon SSE events)
+// ---------------------------------------------------------------------------
+
+/// The payload carried by an `ask_user_question` daemon event.
+///
+/// Contains a batch of questions the agent wants the user to answer.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct AskUserQuestionPayload {
+    pub questions: Vec<AskUserQuestionItem>,
+}
+
+/// One question in an `ask_user_question` batch.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[allow(dead_code)]
+pub struct AskUserQuestionItem {
+    pub id: String,
+    #[serde(default)]
+    pub context: Option<String>,
+    pub question: String,
+    pub mode: AskUserQuestionMode,
+    #[serde(default = "default_true")]
+    pub allow_free_text: bool,
+    #[serde(default)]
+    pub options: Vec<AskUserQuestionOption>,
+}
+
+/// The selection mode for a question.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskUserQuestionMode {
+    SingleSelect,
+    MultiSelect,
+    Text,
+}
+
+/// One selectable option for a question.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[allow(dead_code)]
+pub struct AskUserQuestionOption {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    #[serde(default)]
+    pub justification: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Translation: daemon event → ACP SessionUpdate
 // ---------------------------------------------------------------------------
 
 /// Outcome of processing a daemon event — either something to send to the
 /// ACP client, or a signal that the turn is complete.
+#[allow(clippy::large_enum_variant)]
 pub enum EventTranslation {
     /// Send this SessionUpdate to the ACP client.
     Update(acp::SessionUpdate),
@@ -139,6 +190,12 @@ pub enum EventTranslation {
     PermissionRequest {
         interrogative_id: String,
         question: String,
+    },
+    /// An ask_user_question request from the daemon that needs an ACP round-trip
+    /// via ext_method.
+    AskUserQuestion {
+        interrogative_id: String,
+        payload: AskUserQuestionPayload,
     },
     /// Nothing to send (heartbeat, unknown, etc.)
     Ignore,
@@ -165,14 +222,15 @@ pub fn event_prompt_id(evt: &DaemonEvent) -> Option<&str> {
 pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
     match evt {
         // Text delta → AgentMessageChunk
-        DaemonEvent::ContentBlockDelta { delta, .. } => match delta {
-            BlockDeltaPayload::TextDelta { text } => {
-                let content_block: acp::ContentBlock = text.clone().into();
-                let chunk = acp::ContentChunk::new(content_block);
-                EventTranslation::Update(acp::SessionUpdate::AgentMessageChunk(chunk))
-            }
-            _ => EventTranslation::Ignore,
-        },
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::TextDelta { text },
+            ..
+        } => {
+            let content_block: acp::ContentBlock = text.clone().into();
+            let chunk = acp::ContentChunk::new(content_block);
+            EventTranslation::Update(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
+        DaemonEvent::ContentBlockDelta { .. } => EventTranslation::Ignore,
 
         // Tool call → ToolCall session update
         DaemonEvent::ToolCall { call_id, name, .. } => {
@@ -233,15 +291,21 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             }
         }
 
-        // ask_user_question → auto-respond cancel for v1
-        DaemonEvent::AskUserQuestion { interrogative_id, .. } => {
-            warn!(
+        // ask_user_question → forward to ACP client via ext_method
+        DaemonEvent::AskUserQuestion {
+            interrogative_id,
+            payload,
+            ..
+        } => {
+            debug!(
                 interrogative_id = %interrogative_id,
-                "ask_user_question event received; auto-responding cancel for v1"
+                question_count = payload.questions.len(),
+                "ask_user_question event received; forwarding to ACP client"
             );
-            // We can't auto-respond here because we need the daemon handle.
-            // The caller should handle this. For now, ignore.
-            EventTranslation::Ignore
+            EventTranslation::AskUserQuestion {
+                interrogative_id: interrogative_id.clone(),
+                payload: payload.clone(),
+            }
         }
 
         _ => EventTranslation::Ignore,
@@ -251,11 +315,7 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
 /// Build the ACP permission options for a permission request.
 pub fn build_permission_options() -> Vec<acp::PermissionOption> {
     vec![
-        acp::PermissionOption::new(
-            "allow_once",
-            "Allow",
-            acp::PermissionOptionKind::AllowOnce,
-        ),
+        acp::PermissionOption::new("allow_once", "Allow", acp::PermissionOptionKind::AllowOnce),
         acp::PermissionOption::new(
             "reject_once",
             "Reject",
@@ -266,9 +326,7 @@ pub fn build_permission_options() -> Vec<acp::PermissionOption> {
 
 /// Resolve a permission outcome to a boolean granted value.
 /// Returns (granted, option_id_was_allow) for testability.
-pub fn resolve_permission_outcome(
-    outcome: &acp::RequestPermissionOutcome,
-) -> bool {
+pub fn resolve_permission_outcome(outcome: &acp::RequestPermissionOutcome) -> bool {
     match outcome {
         acp::RequestPermissionOutcome::Cancelled => false,
         acp::RequestPermissionOutcome::Selected(selected) => {
@@ -311,7 +369,9 @@ mod tests {
         let json = r#"{"type":"content_block_delta","prompt_id":"abc","block_index":0,"delta":{"type":"text","text":"hello "}}"#;
         let evt: DaemonEvent = serde_json::from_str(json).unwrap();
         match evt {
-            DaemonEvent::ContentBlockDelta { delta, prompt_id, .. } => {
+            DaemonEvent::ContentBlockDelta {
+                delta, prompt_id, ..
+            } => {
                 assert_eq!(prompt_id, "abc");
                 match delta {
                     BlockDeltaPayload::TextDelta { text } => assert_eq!(text, "hello "),
@@ -351,7 +411,8 @@ mod tests {
 
     #[test]
     fn test_deserialize_tool_call_no_input() {
-        let json = r#"{"type":"tool_call","prompt_id":"abc","call_id":"call_1","name":"read_file"}"#;
+        let json =
+            r#"{"type":"tool_call","prompt_id":"abc","call_id":"call_1","name":"read_file"}"#;
         let evt: DaemonEvent = serde_json::from_str(json).unwrap();
         assert!(matches!(evt, DaemonEvent::ToolCall { .. }));
     }
@@ -368,7 +429,11 @@ mod tests {
         let json = r#"{"type":"interrogative","prompt_id":"abc","interrogative_id":"int_1","question":"Allow read?","interrogative_type":"permission"}"#;
         let evt: DaemonEvent = serde_json::from_str(json).unwrap();
         match evt {
-            DaemonEvent::Interrogative { interrogative_id, question, .. } => {
+            DaemonEvent::Interrogative {
+                interrogative_id,
+                question,
+                ..
+            } => {
                 assert_eq!(interrogative_id, "int_1");
                 assert_eq!(question, "Allow read?");
             }
@@ -526,17 +591,17 @@ mod tests {
 
     #[test]
     fn test_resolve_outcome_selected_allow() {
-        let outcome = acp::RequestPermissionOutcome::Selected(
-            acp::SelectedPermissionOutcome::new("allow_once"),
-        );
+        let outcome = acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+            "allow_once",
+        ));
         assert!(resolve_permission_outcome(&outcome));
     }
 
     #[test]
     fn test_resolve_outcome_selected_reject() {
-        let outcome = acp::RequestPermissionOutcome::Selected(
-            acp::SelectedPermissionOutcome::new("reject_once"),
-        );
+        let outcome = acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+            "reject_once",
+        ));
         assert!(!resolve_permission_outcome(&outcome));
     }
 
@@ -559,5 +624,158 @@ mod tests {
     fn test_extract_text_empty() {
         let blocks: Vec<acp::ContentBlock> = vec![];
         assert_eq!(extract_text(&blocks), "");
+    }
+
+    // ask_user_question tests
+
+    #[test]
+    fn test_deserialize_ask_user_question() {
+        let json = r#"{
+            "type": "ask_user_question",
+            "prompt_id": "abc",
+            "interrogative_id": "int_1",
+            "payload": {
+                "questions": [
+                    {
+                        "id": "q1",
+                        "context": "Choose an approach",
+                        "question": "Which approach?",
+                        "mode": "single_select",
+                        "allow_free_text": true,
+                        "options": [
+                            {"id": "a", "label": "Option A", "description": "Do A"},
+                            {"id": "b", "label": "Option B", "description": "Do B", "justification": "faster", "preview": "diff here"}
+                        ]
+                    },
+                    {
+                        "id": "q2",
+                        "question": "Any notes?",
+                        "mode": "text"
+                    }
+                ]
+            }
+        }"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::AskUserQuestion {
+                prompt_id,
+                interrogative_id,
+                payload,
+            } => {
+                assert_eq!(prompt_id, "abc");
+                assert_eq!(interrogative_id, "int_1");
+                assert_eq!(payload.questions.len(), 2);
+
+                let q1 = &payload.questions[0];
+                assert_eq!(q1.id, "q1");
+                assert_eq!(q1.context.as_deref(), Some("Choose an approach"));
+                assert_eq!(q1.question, "Which approach?");
+                assert_eq!(q1.mode, AskUserQuestionMode::SingleSelect);
+                assert!(q1.allow_free_text);
+                assert_eq!(q1.options.len(), 2);
+                assert_eq!(q1.options[0].id, "a");
+                assert_eq!(q1.options[1].justification.as_deref(), Some("faster"));
+                assert_eq!(q1.options[1].preview.as_deref(), Some("diff here"));
+
+                let q2 = &payload.questions[1];
+                assert_eq!(q2.mode, AskUserQuestionMode::Text);
+                // allow_free_text defaults to true
+                assert!(q2.allow_free_text);
+                assert!(q2.options.is_empty());
+                assert!(q2.context.is_none());
+            }
+            _ => panic!("Expected AskUserQuestion"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_ask_user_question_multi_select() {
+        let json = r#"{
+            "type": "ask_user_question",
+            "prompt_id": "abc",
+            "interrogative_id": "int_1",
+            "payload": {
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Select all that apply",
+                        "mode": "multi_select",
+                        "options": []
+                    }
+                ]
+            }
+        }"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::AskUserQuestion { payload, .. } => {
+                assert_eq!(payload.questions[0].mode, AskUserQuestionMode::MultiSelect);
+            }
+            _ => panic!("Expected AskUserQuestion"),
+        }
+    }
+
+    #[test]
+    fn test_translate_ask_user_question() {
+        let evt = DaemonEvent::AskUserQuestion {
+            prompt_id: "abc".into(),
+            interrogative_id: "int_1".into(),
+            payload: AskUserQuestionPayload {
+                questions: vec![AskUserQuestionItem {
+                    id: "q1".into(),
+                    context: None,
+                    question: "Which?".into(),
+                    mode: AskUserQuestionMode::SingleSelect,
+                    allow_free_text: true,
+                    options: vec![AskUserQuestionOption {
+                        id: "a".into(),
+                        label: "A".into(),
+                        description: "Do A".into(),
+                        justification: None,
+                        preview: None,
+                    }],
+                }],
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::AskUserQuestion {
+                interrogative_id,
+                payload,
+            } => {
+                assert_eq!(interrogative_id, "int_1");
+                assert_eq!(payload.questions.len(), 1);
+                assert_eq!(payload.questions[0].id, "q1");
+            }
+            _ => panic!("Expected AskUserQuestion translation"),
+        }
+    }
+
+    #[test]
+    fn test_ask_user_question_serializes_for_ext_method() {
+        // Verify that the payload round-trips through Serialize → json → Deserialize
+        let payload = AskUserQuestionPayload {
+            questions: vec![AskUserQuestionItem {
+                id: "q1".into(),
+                context: Some("ctx".into()),
+                question: "Which?".into(),
+                mode: AskUserQuestionMode::SingleSelect,
+                allow_free_text: false,
+                options: vec![AskUserQuestionOption {
+                    id: "a".into(),
+                    label: "A".into(),
+                    description: "desc".into(),
+                    justification: Some("because".into()),
+                    preview: Some("preview".into()),
+                }],
+            }],
+        };
+        let json_val = serde_json::to_value(&payload).unwrap();
+        let back: AskUserQuestionPayload = serde_json::from_value(json_val).unwrap();
+        assert_eq!(back.questions.len(), 1);
+        assert_eq!(back.questions[0].id, "q1");
+        assert!(!back.questions[0].allow_free_text);
+        assert_eq!(
+            back.questions[0].options[0].justification.as_deref(),
+            Some("because")
+        );
     }
 }

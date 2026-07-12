@@ -26,7 +26,7 @@ The binary will be at `target/release/polytoken-acp`.
 
 ### Prerequisites
 
-- Rust 1.85+ (the `agent-client-protocol` crate uses edition 2024)
+- Rust 1.85+ (edition 2024, required by `agent-client-protocol` 1.x)
 - The `polytoken` binary on your `PATH`
 
 ## Paseo Configuration
@@ -54,7 +54,7 @@ Then launch Paseo, select "Polytoken" as the provider, and start a session.
 1. **Paseo spawns `polytoken-acp`** as a subprocess and communicates over stdio using JSON-RPC (ACP).
 2. **On `session/new`**, the shim spawns a `polytoken daemon` process for the session's working directory, using a random port and credential file.
 3. **On `session/prompt`**, the shim forwards the prompt text to the daemon's `POST /prompt` endpoint, then connects to the daemon's SSE event stream (`GET /events`) and translates daemon events into ACP `session/update` notifications.
-4. **Permission requests** (interrogative events) are forwarded to the ACP client via `session/request_permission`, and responses are relayed back to the daemon via `POST /interrogative/{id}/respond`.
+4. **Permission requests** (interrogative events) are forwarded to the ACP client via `session/request_permission`, and responses are relayed back to the daemon via `POST /interrogative/{id}/respond`. **`ask_user_question` events** are forwarded via the `polytoken/ask_user_question` extension method, and answers are relayed back.
 5. **On `session/cancel`**, the shim calls `POST /turn/cancel` on the daemon.
 6. **On disconnect** (stdin EOF), the shim terminates all daemon processes.
 
@@ -66,6 +66,7 @@ Then launch Paseo, select "Polytoken" as the provider, and start a session.
 | `tool_call` | `session/update` → `tool_call` (status: pending) |
 | `tool_result` | `session/update` → `tool_call_update` (status: completed/failed) |
 | `interrogative` (permission) | `session/request_permission` → `POST /interrogative/{id}/respond` |
+| `ask_user_question` | `ext_method` (`polytoken/ask_user_question`) → `POST /interrogative/{id}/respond` |
 | `message_complete` | `session/prompt` response with `stop_reason: end_turn` |
 | `turn_cancelled` | `session/prompt` response with `stop_reason: cancelled` |
 | `model_error` | `session/prompt` response with `stop_reason: end_turn` |
@@ -83,6 +84,8 @@ Unit tests cover:
 - SSE event deserialization (all handled event types + `#[serde(other)]` catch-all)
 - Event-to-ACP translation (text delta, tool call, tool result, message complete, turn cancelled, interrogative)
 - Permission translation (options construction, outcome→granted mapping)
+- `ask_user_question` event deserialization (payload with questions, options, modes) and translation
+- `ask_user_question` payload serialization for ext_method forwarding
 - Content block text extraction
 
 ### Integration Tests
@@ -118,6 +121,4 @@ The shim's own logging goes to stderr only. The daemon child process's stdout is
 ## Limitations (v1)
 
 - **MCP server forwarding**: Paseo's `mcpServers` are acknowledged but not forwarded to the polytoken daemon. Configure MCP servers in your `~/.config/polytoken/` config instead.
-- **`ask_user_question` events**: Auto-responded with a default/cancel response. The interactive `ask_user_question` tool does not work through Paseo in v1.
-- **Session listing**: `session/list` returns an empty list.
-- **Session modes**: Not supported (`set_session_mode` is a no-op).
+- **`ask_user_question` via ext_method**: The daemon's `ask_user_question` events are forwarded to the ACP client via the `polytoken/ask_user_question` extension method. The client must implement `ext_method` and return a JSON object with an `answers` array (each answer has `question_id`, `selected_option_ids`, and/or `free_text`). If the client does not support the extension or returns no answers, the interrogative is cancelled on the daemon so the agent can proceed.

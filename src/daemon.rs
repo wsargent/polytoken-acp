@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rand::Rng;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
@@ -21,6 +21,7 @@ pub struct DaemonHandle {
     base_url: String,
     bearer_token: String,
     session_id: String,
+    cwd: std::path::PathBuf,
     child: Option<Child>,
     #[allow(dead_code)]
     sessions_dir: PathBuf,
@@ -45,6 +46,7 @@ struct PromptAcceptedResponse {
 
 /// Subset of the daemon's `GET /state` response (`SessionStateSnapshot`)
 /// that we need to populate the ACP model list.
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub(crate) struct SessionStateSnapshot {
     #[serde(default)]
@@ -54,6 +56,7 @@ pub(crate) struct SessionStateSnapshot {
 }
 
 /// One entry in the daemon's available-model list.
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub(crate) struct AvailableModelEntry {
     pub name: String,
@@ -70,18 +73,15 @@ impl DaemonHandle {
         let cred_path = temp_dir.join("credential.json");
 
         // Create temp dir with 0700 permissions (polytoken requires it)
-        std::fs::create_dir_all(&temp_dir)
-            .context("Failed to create temp dir")?;
+        std::fs::create_dir_all(&temp_dir).context("Failed to create temp dir")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o700))
                 .context("Failed to set temp dir permissions")?;
         }
-        std::fs::create_dir_all(&sessions_dir)
-            .context("Failed to create sessions dir")?;
-        std::fs::create_dir_all(&log_dir)
-            .context("Failed to create log dir")?;
+        std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions dir")?;
+        std::fs::create_dir_all(&log_dir).context("Failed to create log dir")?;
 
         let bearer_token = generate_token();
         let cred_json = serde_json::json!({
@@ -104,12 +104,18 @@ impl DaemonHandle {
 
         let mut child = Command::new("polytoken")
             .arg("daemon")
-            .arg("--project-dir").arg(cwd)
-            .arg("--credential-file").arg(&cred_path)
-            .arg("--listen").arg("127.0.0.1:0")
-            .arg("--sessions-dir").arg(&sessions_dir)
-            .arg("--log-dir").arg(&log_dir)
-            .arg("--session-id").arg(&session_id)
+            .arg("--project-dir")
+            .arg(cwd)
+            .arg("--credential-file")
+            .arg(&cred_path)
+            .arg("--listen")
+            .arg("127.0.0.1:0")
+            .arg("--sessions-dir")
+            .arg(&sessions_dir)
+            .arg("--log-dir")
+            .arg(&log_dir)
+            .arg("--session-id")
+            .arg(&session_id)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -150,10 +156,8 @@ impl DaemonHandle {
 
         // Poll startup.json until state == "ready"
         let startup_path = sessions_dir.join(&session_id).join("startup.json");
-        let timeout_result = tokio::time::timeout(
-            STARTUP_TIMEOUT,
-            poll_startup(&startup_path),
-        ).await;
+        let timeout_result =
+            tokio::time::timeout(STARTUP_TIMEOUT, poll_startup(&startup_path)).await;
 
         let port = match timeout_result {
             Ok(Ok(p)) => p,
@@ -166,13 +170,21 @@ impl DaemonHandle {
                 match child.try_wait() {
                     Ok(Some(status)) => bail!(
                         "Polytoken daemon exited during startup with status: {}. Check logs at {:?}",
-                        status, log_dir
+                        status,
+                        log_dir
                     ),
                     Ok(None) => {
                         let _ = child.kill().await;
-                        bail!("Polytoken daemon failed to become ready within {} seconds. Check logs at {:?}", STARTUP_TIMEOUT.as_secs(), log_dir);
+                        bail!(
+                            "Polytoken daemon failed to become ready within {} seconds. Check logs at {:?}",
+                            STARTUP_TIMEOUT.as_secs(),
+                            log_dir
+                        );
                     }
-                    Err(e) => bail!("Daemon startup timed out and process status check failed: {}", e),
+                    Err(e) => bail!(
+                        "Daemon startup timed out and process status check failed: {}",
+                        e
+                    ),
                 }
             }
         };
@@ -185,6 +197,7 @@ impl DaemonHandle {
             base_url: base_url.clone(),
             bearer_token,
             session_id,
+            cwd: cwd.to_path_buf(),
             child: Some(child),
             sessions_dir,
             log_dir,
@@ -199,7 +212,9 @@ impl DaemonHandle {
             }
             if attempt == 9 {
                 let _ = handle.child.as_mut().unwrap().kill().await;
-                bail!("Daemon startup.json says ready but /health is not responding after 10 attempts");
+                bail!(
+                    "Daemon startup.json says ready but /health is not responding after 10 attempts"
+                );
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -220,8 +235,10 @@ impl DaemonHandle {
             .context("Failed to send prompt to daemon")?;
 
         let status = resp.status();
-        let body: PromptAcceptedResponse = resp.json().await
-            .context(format!("Failed to parse prompt response (status {})", status))?;
+        let body: PromptAcceptedResponse = resp.json().await.context(format!(
+            "Failed to parse prompt response (status {})",
+            status
+        ))?;
 
         debug!(prompt_id = %body.prompt_id, "Prompt accepted by daemon");
         Ok(body.prompt_id)
@@ -234,6 +251,7 @@ impl DaemonHandle {
     }
 
     /// Cancel the current turn.
+    #[allow(dead_code)]
     pub async fn cancel_turn(&self) -> Result<()> {
         let client = reqwest::Client::new();
         let url = format!("{}/turn/cancel", self.base_url);
@@ -253,7 +271,10 @@ impl DaemonHandle {
     #[allow(dead_code)]
     pub async fn respond_interrogative(&self, interrogative_id: &str, granted: bool) -> Result<()> {
         let client = reqwest::Client::new();
-        let url = format!("{}/interrogative/{}/respond", self.base_url, interrogative_id);
+        let url = format!(
+            "{}/interrogative/{}/respond",
+            self.base_url, interrogative_id
+        );
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.bearer_token))
@@ -283,6 +304,7 @@ impl DaemonHandle {
     }
 
     /// Fetch the daemon's session state snapshot (the subset we need).
+    #[allow(dead_code)]
     pub async fn fetch_session_state(&self) -> Result<SessionStateSnapshot> {
         let client = reqwest::Client::new();
         let url = format!("{}/state", self.base_url);
@@ -301,6 +323,7 @@ impl DaemonHandle {
     }
 
     /// Switch the active model by POSTing to `/model`.
+    #[allow(dead_code)]
     pub async fn set_model(&self, model_name: &str) -> Result<()> {
         let client = reqwest::Client::new();
         let url = format!("{}/model", self.base_url);
@@ -338,6 +361,47 @@ impl DaemonHandle {
         &self.session_id
     }
 
+    /// The working directory of this daemon.
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
+    /// Switch the active facet by POSTing to `/facet`.
+    #[allow(dead_code)]
+    pub async fn set_facet(&self, facet: &str) -> Result<()> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/facet", self.base_url);
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.bearer_token))
+            .json(&serde_json::json!({ "facet": facet }))
+            .send()
+            .await
+            .context("Failed to POST /facet")?;
+        if !resp.status().is_success() {
+            bail!("POST /facet returned status {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Fetch the full daemon state snapshot.
+    pub async fn fetch_daemon_state(&self) -> Result<serde_json::Value> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/state", self.base_url);
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.bearer_token))
+            .send()
+            .await
+            .context("Failed to GET /state")?;
+        if !resp.status().is_success() {
+            bail!("GET /state returned status {}", resp.status());
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .context("Failed to parse /state response")
+    }
+
     /// Terminate the daemon gracefully.
     pub async fn terminate(&mut self) {
         let client = reqwest::Client::new();
@@ -368,22 +432,24 @@ impl Drop for DaemonHandle {
 
 async fn poll_startup(startup_path: &Path) -> Result<u16> {
     loop {
-        if let Ok(content) = std::fs::read_to_string(startup_path) {
-            if let Ok(startup) = serde_json::from_str::<StartupJson>(&content) {
-                match startup.state.as_str() {
-                    "ready" => {
-                        if let Some(port) = startup.port {
-                            return Ok(port);
-                        }
-                        bail!("startup.json has no port field");
+        if let Ok(content) = std::fs::read_to_string(startup_path)
+            && let Ok(startup) = serde_json::from_str::<StartupJson>(&content)
+        {
+            match startup.state.as_str() {
+                "ready" => {
+                    if let Some(port) = startup.port {
+                        return Ok(port);
                     }
-                    "failed" => {
-                        let msg = startup.message.unwrap_or_else(|| "unknown error".to_string());
-                        bail!("Polytoken daemon failed to start: {}", msg);
-                    }
-                    _ => {
-                        // Still starting up
-                    }
+                    bail!("startup.json has no port field");
+                }
+                "failed" => {
+                    let msg = startup
+                        .message
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    bail!("Polytoken daemon failed to start: {}", msg);
+                }
+                _ => {
+                    // Still starting up
                 }
             }
         }
@@ -397,9 +463,8 @@ async fn poll_startup(startup_path: &Path) -> Result<u16> {
 fn generate_session_id() -> String {
     const CROCKFORD: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
     const WORDS: &[&str] = &[
-        "acp", "junky", "river", "delta", "alpha", "forge", "nova",
-        "echo", "flux", "gamma", "halo", "iris", "jolt", "keen",
-        "lunar", "mega", "nimbus", "opal", "pulse", "quill",
+        "acp", "junky", "river", "delta", "alpha", "forge", "nova", "echo", "flux", "gamma",
+        "halo", "iris", "jolt", "keen", "lunar", "mega", "nimbus", "opal", "pulse", "quill",
     ];
     let mut rng = rand::thread_rng();
     let prefix: String = (0..6)

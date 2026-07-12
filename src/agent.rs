@@ -1,302 +1,411 @@
-//! ACP `Agent` trait implementation for the polytoken daemon shim.
+//! ACP Agent implementation for the polytoken daemon shim.
+//!
+//! In ACP 1.x, the agent is built using a builder pattern with
+//! `on_receive_request` / `on_receive_notification` handlers rather than
+//! implementing a trait. The shared session state (daemon handles) lives in
+//! an `Arc<Mutex<>>` captured by each handler closure.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::{self as acp, Client};
+use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, Dispatch, Stdio, on_receive_dispatch, on_receive_notification,
+    on_receive_request,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::DaemonHandle;
-use crate::events::{self, EventTranslation};
+use crate::events::{self, AskUserQuestionPayload, EventTranslation};
 
-/// A boxed future used with tokio::task::spawn_local.
-#[allow(dead_code)]
-type LocalBoxFuture = Pin<Box<dyn Future<Output = ()>>>;
-
-/// The polytoken ACP agent — implements `acp::Agent`.
-///
-/// Holds a map of ACP sessions to daemon handles, and a back-reference to
-/// the `AgentSideConnection` (set after connection creation).
-pub struct PolytokenAgent {
-    sessions: RefCell<HashMap<String, DaemonHandle>>,
-    conn: RefCell<Option<Rc<acp::AgentSideConnection>>>,
+/// Shared state across all ACP handlers for one connection.
+struct AgentState {
+    sessions: HashMap<String, DaemonHandle>,
 }
 
-impl PolytokenAgent {
-    pub fn new() -> Self {
+impl AgentState {
+    fn new() -> Self {
         Self {
-            sessions: RefCell::new(HashMap::new()),
-            conn: RefCell::new(None),
+            sessions: HashMap::new(),
         }
     }
 
-    /// Called after `AgentSideConnection::new` to inject the connection ref.
-    pub fn set_connection(&self, conn: Rc<acp::AgentSideConnection>) {
-        *self.conn.borrow_mut() = Some(conn);
-    }
-
-    fn conn(&self) -> Rc<acp::AgentSideConnection> {
-        self.conn.borrow().clone().expect("connection not set")
-    }
-
-    /// Terminates all daemon processes.
-    pub async fn shutdown(&self) {
-        // Take all daemons out of the map first, then terminate without holding borrow
-        let daemons: Vec<(String, DaemonHandle)> = {
-            let mut sessions = self.sessions.borrow_mut();
-            sessions.drain().collect()
-        };
+    /// Take all daemons out of the map and terminate them.
+    #[allow(dead_code)]
+    async fn shutdown(&mut self) {
+        let daemons: Vec<(String, DaemonHandle)> = self.sessions.drain().collect();
         for (_, mut daemon) in daemons {
             daemon.terminate().await;
         }
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl acp::Agent for PolytokenAgent {
-    async fn initialize(&self, req: acp::InitializeRequest) -> acp::Result<acp::InitializeResponse> {
-        info!("ACP initialize from client");
-        let caps = acp::AgentCapabilities::new()
-            .load_session(false)
-            .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
-            .mcp_capabilities(acp::McpCapabilities::new()) // http=false, sse=false
-            .session_capabilities(
-                acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new()),
-            );
+/// Entry point: build the agent, wire up handlers, and run over stdio.
+pub async fn run() {
+    let state = Arc::new(Mutex::new(AgentState::new()));
 
-        Ok(acp::InitializeResponse::new(req.protocol_version)
-            .agent_capabilities(caps)
-            .agent_info(
-                acp::Implementation::new("polytoken", env!("CARGO_PKG_VERSION"))
-                    .title("Polytoken"),
-            ))
+    let result = Agent
+        .builder()
+        .name("polytoken")
+        // initialize
+        .on_receive_request(
+            async |_req: acp::InitializeRequest, responder, _cx| {
+                info!("ACP initialize from client");
+                let caps = acp::AgentCapabilities::new()
+                    .load_session(false)
+                    .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
+                    .mcp_capabilities(acp::McpCapabilities::new())
+                    .session_capabilities(
+                        acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new()),
+                    );
+                let resp = acp::InitializeResponse::new(_req.protocol_version)
+                    .agent_capabilities(caps)
+                    .agent_info(
+                        acp::Implementation::new("polytoken", env!("CARGO_PKG_VERSION"))
+                            .title("Polytoken"),
+                    );
+                responder.respond(resp)
+            },
+            on_receive_request!(),
+        )
+        // authenticate
+        .on_receive_request(
+            async |_req: acp::AuthenticateRequest, responder, _cx| {
+                responder.respond(acp::AuthenticateResponse::new())
+            },
+            on_receive_request!(),
+        )
+        // new_session
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::NewSessionRequest, responder, cx| {
+                    handle_new_session(&state, req, responder, cx).await
+                }
+            },
+            on_receive_request!(),
+        )
+        // prompt
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::PromptRequest, responder, cx| {
+                    handle_prompt(&state, req, responder, cx).await
+                }
+            },
+            on_receive_request!(),
+        )
+        // list_sessions
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::ListSessionsRequest, responder, cx| {
+                    handle_list_sessions(&state, req, responder, cx).await
+                }
+            },
+            on_receive_request!(),
+        )
+        // set_session_mode
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::SetSessionModeRequest, responder, cx| {
+                    handle_set_session_mode(&state, req, responder, cx).await
+                }
+            },
+            on_receive_request!(),
+        )
+        // set_session_config_option
+        .on_receive_request(
+            async |_req: acp::SetSessionConfigOptionRequest, responder, _cx| {
+                responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]))
+            },
+            on_receive_request!(),
+        )
+        // cancel (notification)
+        .on_receive_notification(
+            {
+                let state = Arc::clone(&state);
+                async move |notif: acp::CancelNotification, _cx| {
+                    handle_cancel(&state, &notif).await;
+                    Ok(())
+                }
+            },
+            on_receive_notification!(),
+        )
+        // Fallback: respond to any unhandled message with an error
+        .on_receive_dispatch(
+            async move |message: Dispatch, cx| {
+                message.respond_with_error(
+                    agent_client_protocol::util::internal_error("unhandled message"),
+                    cx,
+                )
+            },
+            on_receive_dispatch!(),
+        )
+        .connect_to(Stdio::new())
+        .await;
+
+    match &result {
+        Ok(()) => info!("ACP connection closed gracefully"),
+        Err(e) => error!(error = %e, "ACP connection ended with error"),
     }
 
-    async fn authenticate(
-        &self,
-        _req: acp::AuthenticateRequest,
-    ) -> acp::Result<acp::AuthenticateResponse> {
-        Ok(acp::AuthenticateResponse::new())
+    // Clean up: terminate all daemon processes
+    let daemons: Vec<(String, DaemonHandle)> = state.lock().unwrap().sessions.drain().collect();
+    for (_, mut daemon) in daemons {
+        daemon.terminate().await;
+    }
+    info!("polytoken-acp shutting down");
+}
+
+// ---------------------------------------------------------------------------
+// Request handlers
+// ---------------------------------------------------------------------------
+
+async fn handle_new_session(
+    state: &Arc<Mutex<AgentState>>,
+    req: acp::NewSessionRequest,
+    responder: agent_client_protocol::Responder<acp::NewSessionResponse>,
+    _cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    info!(cwd = ?req.cwd, "ACP new_session");
+
+    if !req.mcp_servers.is_empty() {
+        warn!(
+            count = req.mcp_servers.len(),
+            "MCP servers passed by client are acknowledged but not forwarded (v1)"
+        );
     }
 
-    async fn new_session(
-        &self,
-        req: acp::NewSessionRequest,
-    ) -> acp::Result<acp::NewSessionResponse> {
-        info!(cwd = ?req.cwd, "ACP new_session");
+    match DaemonHandle::spawn(&req.cwd).await {
+        Ok(daemon) => {
+            let session_id = daemon.session_id().to_string();
 
-        // Acknowledge but ignore MCP servers — polytoken manages its own MCP config.
-        if !req.mcp_servers.is_empty() {
-            warn!(
-                count = req.mcp_servers.len(),
-                "MCP servers passed by client are acknowledged but not forwarded (v1)"
-            );
+            // Build the session mode state from the daemon's facets.
+            // Polytoken has two facets: "execute" (default) and "plan".
+            let modes = build_session_mode_state(&daemon).await;
+
+            state
+                .lock()
+                .unwrap()
+                .sessions
+                .insert(session_id.clone(), daemon);
+
+            info!(session_id = %session_id, "New session created");
+            let mut response = acp::NewSessionResponse::new(session_id);
+            if let Some(ms) = modes {
+                response = response.modes(ms);
+            }
+            responder.respond(response)
         }
-
-        let daemon = DaemonHandle::spawn(&req.cwd)
-            .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to spawn daemon");
-                acp::Error::internal_error().data(serde_json::json!({
+        Err(e) => {
+            error!(error = %e, "Failed to spawn daemon");
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({
                     "error": "Failed to start polytoken daemon",
                     "detail": e.to_string(),
-                }))
-            })?;
-
-        let session_id = daemon.session_id().to_string();
-
-        // Fetch available models from the daemon so the ACP client (Paseo)
-        // can display a model selector — before moving the handle into the map.
-        let models = match daemon.fetch_session_state().await {
-            Ok(state) => {
-                let available: Vec<acp::ModelInfo> = state
-                    .available_models
-                    .iter()
-                    .map(|m| acp::ModelInfo::new(m.name.clone(), m.label.clone()))
-                    .collect();
-                let current = state
-                    .active_model
-                    .unwrap_or_else(|| {
-                        state
-                            .available_models
-                            .first()
-                            .map(|m| m.name.clone())
-                            .unwrap_or_default()
-                    });
-                if available.is_empty() {
-                    None
-                } else {
-                    Some(acp::SessionModelState::new(current, available))
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to fetch session state for models; continuing without model list");
-                None
-            }
-        };
-
-        self.sessions
-            .borrow_mut()
-            .insert(session_id.clone(), daemon);
-
-        info!(session_id = %session_id, models = ?models.is_some(), "New session created");
-        let mut response = acp::NewSessionResponse::new(session_id);
-        if let Some(ms) = models {
-            response = response.models(ms);
+                }),
+            ))
         }
-        Ok(response)
     }
+}
 
-    async fn prompt(&self, req: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
-        let session_id = req.session_id.to_string();
-        let prompt_text = events::extract_text(&req.prompt);
+async fn handle_prompt(
+    state: &Arc<Mutex<AgentState>>,
+    req: acp::PromptRequest,
+    responder: agent_client_protocol::Responder<acp::PromptResponse>,
+    cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = req.session_id.0.to_string();
+    let prompt_text = events::extract_text(&req.prompt);
 
-        info!(session_id = %session_id, "ACP prompt");
+    info!(session_id = %session_id, "ACP prompt");
 
-        // Collect connection info without holding borrow across await
-        let (events_url, bearer_token, base_url) = {
-            let sessions = self.sessions.borrow();
-            let daemon = sessions.get(&session_id).ok_or_else(|| {
+    // Collect connection info without holding lock across await
+    let (events_url, bearer_token, base_url) = {
+        let sessions = state.lock().unwrap();
+        let daemon = match sessions.sessions.get(&session_id) {
+            Some(d) => d,
+            None => {
                 error!(session_id = %session_id, "Session not found");
-                acp::Error::internal_error().data(serde_json::json!({
-                    "error": "Session not found"
-                }))
-            })?;
-            let events_url = daemon.events_url();
-            let bearer_token = daemon.bearer_token().to_string();
-            let base_url = daemon.base_url().to_string();
-            (events_url, bearer_token, base_url)
+                return responder.respond_with_error(
+                    agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                        "error": "Session not found"
+                    })),
+                );
+            }
         };
-        // Borrow released here — send prompt with owned data
-        let prompt_id = DaemonHandle::prompt_with(
-            &base_url,
-            &bearer_token,
-            &prompt_text,
+        (
+            daemon.events_url(),
+            daemon.bearer_token().to_string(),
+            daemon.base_url().to_string(),
         )
-        .await
-        .map_err(|e| {
+    };
+
+    // Send prompt to daemon
+    let prompt_id = match DaemonHandle::prompt_with(&base_url, &bearer_token, &prompt_text).await {
+        Ok(id) => id,
+        Err(e) => {
             error!(error = %e, "Failed to send prompt to daemon");
-            acp::Error::internal_error().data(serde_json::json!({
-                "error": "Failed to forward prompt to daemon",
-                "detail": e.to_string(),
-            }))
-        })?;
-
-        info!(session_id = %session_id, prompt_id = %prompt_id, "Prompt forwarded to daemon");
-
-        // Get connection rc for the SSE consumer
-        let conn = self.conn();
-
-        // Channel for signaling turn completion
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        // Spawn SSE consumer on the LocalSet
-        let consumer = SseConsumer {
-            conn,
-            session_id: session_id.clone(),
-            prompt_id: prompt_id.clone(),
-            events_url,
-            bearer_token,
-            base_url,
-            done_tx: tx,
-        };
-
-        tokio::task::spawn_local(async move {
-            consumer.run().await;
-        });
-
-        // Wait for the turn to complete
-        let stop_reason = match rx.await {
-            Ok(reason) => reason,
-            Err(_) => {
-                // Consumer task was cancelled/closed unexpectedly
-                error!(prompt_id = %prompt_id, "SSE consumer task ended unexpectedly");
-                acp::StopReason::EndTurn
-            }
-        };
-
-        info!(session_id = %session_id, prompt_id = %prompt_id, stop_reason = ?stop_reason, "Prompt turn complete");
-        Ok(acp::PromptResponse::new(stop_reason))
-    }
-
-    async fn cancel(&self, req: acp::CancelNotification) -> acp::Result<()> {
-        let session_id = req.session_id.to_string();
-        info!(session_id = %session_id, "ACP cancel");
-
-        let sessions = self.sessions.borrow();
-        if let Some(daemon) = sessions.get(&session_id) {
-            if let Err(e) = daemon.cancel_turn().await {
-                warn!(error = %e, "Failed to cancel daemon turn");
-            }
-        }
-        Ok(())
-    }
-
-    async fn list_sessions(
-        &self,
-        _req: acp::ListSessionsRequest,
-    ) -> acp::Result<acp::ListSessionsResponse> {
-        // v1 stub: return empty list
-        Ok(acp::ListSessionsResponse::new(vec![]))
-    }
-
-    async fn set_session_mode(
-        &self,
-        _req: acp::SetSessionModeRequest,
-    ) -> acp::Result<acp::SetSessionModeResponse> {
-        Ok(acp::SetSessionModeResponse::new())
-    }
-
-    async fn set_session_config_option(
-        &self,
-        _req: acp::SetSessionConfigOptionRequest,
-    ) -> acp::Result<acp::SetSessionConfigOptionResponse> {
-        Ok(acp::SetSessionConfigOptionResponse::new(vec![]))
-    }
-
-    async fn set_session_model(
-        &self,
-        req: acp::SetSessionModelRequest,
-    ) -> acp::Result<acp::SetSessionModelResponse> {
-        let session_id = req.session_id.to_string();
-        let model_id = req.model_id.0.to_string();
-
-        info!(session_id = %session_id, model_id = %model_id, "ACP set_session_model");
-
-        let sessions = self.sessions.borrow();
-        let daemon = sessions.get(&session_id).ok_or_else(|| {
-            error!(session_id = %session_id, "Session not found for set_session_model");
-            acp::Error::internal_error().data(serde_json::json!({
-                "error": "Session not found"
-            }))
-        })?;
-
-        daemon
-            .set_model(&model_id)
-            .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to set model on daemon");
-                acp::Error::internal_error().data(serde_json::json!({
-                    "error": "Failed to switch model",
+            return responder.respond_with_error(
+                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                    "error": "Failed to forward prompt to daemon",
                     "detail": e.to_string(),
-                }))
-            })?;
+                })),
+            );
+        }
+    };
 
-        info!(session_id = %session_id, model_id = %model_id, "Model switched");
-        Ok(acp::SetSessionModelResponse::new())
-    }
+    info!(session_id = %session_id, prompt_id = %prompt_id, "Prompt forwarded to daemon");
 
-    async fn ext_method(&self, _req: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-        Ok(acp::ExtResponse::new(
-            serde_json::value::RawValue::NULL.to_owned().into(),
-        ))
-    }
+    // Spawn the SSE consumer as a background task.
+    // The responder is moved into the task; when the turn completes,
+    // the task responds with the stop reason.
+    let consumer = SseConsumer {
+        conn: cx.clone(),
+        session_id: session_id.clone(),
+        prompt_id: prompt_id.clone(),
+        events_url,
+        bearer_token,
+        base_url,
+        responder,
+    };
 
-    async fn ext_notification(&self, _req: acp::ExtNotification) -> acp::Result<()> {
-        Ok(())
+    cx.spawn(consumer.run())?;
+
+    Ok(())
+}
+
+async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotification) {
+    let session_id = notif.session_id.0.to_string();
+    info!(session_id = %session_id, "ACP cancel");
+
+    // We need to take the daemon out briefly to call cancel (which is async).
+    // Since we can't hold the lock across await, we clone the necessary bits.
+    let (base_url, bearer) = {
+        let sessions = state.lock().unwrap();
+        match sessions.sessions.get(&session_id) {
+            Some(daemon) => (
+                daemon.base_url().to_string(),
+                daemon.bearer_token().to_string(),
+            ),
+            None => return,
+        }
+    };
+
+    // Cancel via HTTP directly (no lock needed)
+    let client = reqwest::Client::new();
+    let url = format!("{}/turn/cancel", base_url);
+    let _ = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer))
+        .send()
+        .await;
+}
+
+/// Build the ACP SessionModeState from the daemon's current facet and known facets.
+/// Polytoken has two facets: "execute" (default) and "plan".
+async fn build_session_mode_state(daemon: &DaemonHandle) -> Option<acp::SessionModeState> {
+    let active_facet = match daemon.fetch_daemon_state().await {
+        Ok(state) => state
+            .get("active_facet")
+            .and_then(|v| v.as_str())
+            .unwrap_or("execute")
+            .to_string(),
+        Err(e) => {
+            warn!(error = %e, "Failed to fetch daemon state for modes; defaulting to execute");
+            "execute".to_string()
+        }
+    };
+
+    let modes = vec![
+        acp::SessionMode::new("execute", "Execute")
+            .description("Agent executes tasks, writes files, and runs commands"),
+        acp::SessionMode::new("plan", "Plan")
+            .description("Agent plans and reviews before making changes"),
+    ];
+
+    Some(acp::SessionModeState::new(active_facet, modes))
+}
+
+async fn handle_list_sessions(
+    state: &Arc<Mutex<AgentState>>,
+    _req: acp::ListSessionsRequest,
+    responder: agent_client_protocol::Responder<acp::ListSessionsResponse>,
+    _cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let sessions = state.lock().unwrap();
+    let session_infos: Vec<acp::SessionInfo> = sessions
+        .sessions
+        .iter()
+        .map(|(id, daemon)| acp::SessionInfo::new(id.clone(), daemon.cwd().to_path_buf()))
+        .collect();
+    responder.respond(acp::ListSessionsResponse::new(session_infos))
+}
+
+async fn handle_set_session_mode(
+    state: &Arc<Mutex<AgentState>>,
+    req: acp::SetSessionModeRequest,
+    responder: agent_client_protocol::Responder<acp::SetSessionModeResponse>,
+    _cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = req.session_id.0.to_string();
+    let mode_id = req.mode_id.0.to_string();
+
+    info!(session_id = %session_id, mode_id = %mode_id, "ACP set_session_mode");
+
+    let result = {
+        let sessions = state.lock().unwrap();
+        let daemon = match sessions.sessions.get(&session_id) {
+            Some(d) => d,
+            None => {
+                drop(sessions);
+                return responder.respond_with_error(
+                    agent_client_protocol::Error::internal_error()
+                        .data(serde_json::json!({"error": "Session not found"})),
+                );
+            }
+        };
+        // Clone the connection info before releasing the lock
+        (
+            daemon.base_url().to_string(),
+            daemon.bearer_token().to_string(),
+        )
+    }; // lock released here
+
+    let (base_url, bearer) = result;
+    let client = reqwest::Client::new();
+    let url = format!("{}/facet", base_url);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer))
+        .json(&serde_json::json!({ "facet": mode_id }))
+        .send()
+        .await;
+    let result = match resp {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => Err(anyhow::anyhow!(
+            "POST /facet returned status {}",
+            r.status()
+        )),
+        Err(e) => Err(anyhow::anyhow!("Failed to POST /facet: {}", e)),
+    };
+
+    match result {
+        Ok(()) => {
+            info!(session_id = %session_id, mode_id = %mode_id, "Facet switched");
+            responder.respond(acp::SetSessionModeResponse::new())
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to switch facet");
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({
+                    "error": "Failed to switch facet",
+                    "detail": e.to_string(),
+                }),
+            ))
+        }
     }
 }
 
@@ -306,212 +415,74 @@ impl acp::Agent for PolytokenAgent {
 
 /// The SSE consumer task that bridges daemon events to ACP notifications.
 struct SseConsumer {
-    conn: Rc<acp::AgentSideConnection>,
+    conn: ConnectionTo<Client>,
     session_id: String,
     prompt_id: String,
     events_url: String,
     bearer_token: String,
     base_url: String,
-    done_tx: tokio::sync::oneshot::Sender<acp::StopReason>,
+    responder: agent_client_protocol::Responder<acp::PromptResponse>,
 }
 
 impl SseConsumer {
-    async fn run(self) {
+    async fn run(self) -> Result<(), agent_client_protocol::Error> {
         let max_retries = 3;
         let mut retry_count = 0;
 
+        let conn = self.conn;
+        let session_id = self.session_id;
+        let prompt_id = self.prompt_id;
+        let events_url = self.events_url;
+        let bearer_token = self.bearer_token;
+        let base_url = self.base_url;
+        let mut responder = Some(self.responder);
+
         loop {
-            match self.connect_and_consume().await {
+            match connect_and_consume(
+                &events_url,
+                &bearer_token,
+                &base_url,
+                &prompt_id,
+                &session_id,
+                &conn,
+            )
+            .await
+            {
                 ConsumeOutcome::Done(stop_reason) => {
-                    let _ = self.done_tx.send(stop_reason);
-                    return;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    info!(
+                        prompt_id = %prompt_id,
+                        stop_reason = ?stop_reason,
+                        "Prompt turn complete"
+                    );
+                    return responder
+                        .take()
+                        .expect("responder already consumed")
+                        .respond(acp::PromptResponse::new(stop_reason));
                 }
                 ConsumeOutcome::Error => {
                     retry_count += 1;
                     if retry_count >= max_retries {
                         error!(
-                            prompt_id = %self.prompt_id,
+                            prompt_id = %prompt_id,
                             retries = retry_count,
                             "SSE consumer exhausted retries; ending turn"
                         );
-                        let _ = self.done_tx.send(acp::StopReason::EndTurn);
-                        return;
+                        return responder
+                            .take()
+                            .expect("responder already consumed")
+                            .respond(acp::PromptResponse::new(acp::StopReason::EndTurn));
                     }
                     warn!(
-                        prompt_id = %self.prompt_id,
+                        prompt_id = %prompt_id,
                         retry = retry_count,
                         "SSE connection error; retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
-                ConsumeOutcome::Continue => {
-                    // Stream reconnected; continue the outer loop
-                }
+                ConsumeOutcome::Continue => {}
             }
         }
-    }
-
-    async fn connect_and_consume(&self) -> ConsumeOutcome {
-        let client = reqwest::Client::new();
-        let response = client
-            .get(&self.events_url)
-            .header("Authorization", format!("Bearer {}", self.bearer_token))
-            .header("Accept", "text/event-stream")
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                error!(status = %r.status(), "SSE connection returned non-200");
-                return ConsumeOutcome::Error;
-            }
-            Err(e) => {
-                error!(error = %e, "SSE connection failed");
-                return ConsumeOutcome::Error;
-            }
-        };
-
-        debug!("SSE stream connected");
-
-        use futures::StreamExt;
-        let mut stream = response.bytes_stream();
-        let mut parser = SseParser::new();
-
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = match chunk_result {
-                Ok(c) => c,
-                Err(e) => {
-                    error!(error = %e, "SSE stream error");
-                    return ConsumeOutcome::Error;
-                }
-            };
-
-            let data_lines = parser.feed(&chunk);
-            for data in data_lines {
-                match self.process_sse_event(&data).await {
-                    ConsumeOutcome::Done(reason) => return ConsumeOutcome::Done(reason),
-                    ConsumeOutcome::Error => return ConsumeOutcome::Error,
-                    ConsumeOutcome::Continue => {}
-                }
-            }
-        }
-
-        // Stream ended without message_complete
-        warn!(prompt_id = %self.prompt_id, "SSE stream ended without explicit turn end");
-        ConsumeOutcome::Done(acp::StopReason::EndTurn)
-    }
-
-    async fn process_sse_event(&self, data: &str) -> ConsumeOutcome {
-        let event = match events::parse_sse_event(data) {
-            Some(e) => e,
-            None => {
-                debug!(data = %data.chars().take(200).collect::<String>(), "Failed to parse SSE event; skipping");
-                return ConsumeOutcome::Continue;
-            }
-        };
-
-        debug!(event_type = ?std::mem::discriminant(&event), "SSE event received");
-
-        // Filter by prompt_id if the event has one
-        if let Some(epid) = events::event_prompt_id(&event) {
-            if epid != self.prompt_id {
-                return ConsumeOutcome::Continue;
-            }
-        }
-
-        match events::translate_event(&event) {
-            EventTranslation::Update(update) => {
-                let session_id = acp::SessionId::new(self.session_id.clone());
-                let notification = acp::SessionNotification::new(session_id, update.clone());
-                if let Err(e) = self.conn.session_notification(notification).await {
-                    error!(error = %e, "Failed to send session notification");
-                }
-                ConsumeOutcome::Continue
-            }
-            EventTranslation::TurnEnd => {
-                // Small delay to ensure pending notifications are flushed
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                ConsumeOutcome::Done(acp::StopReason::EndTurn)
-            }
-            EventTranslation::TurnCancelled => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                ConsumeOutcome::Done(acp::StopReason::Cancelled)
-            }
-            EventTranslation::PermissionRequest {
-                interrogative_id,
-                question,
-            } => {
-                self.handle_permission(&interrogative_id.clone(), &question.clone()).await;
-                ConsumeOutcome::Continue
-            }
-            EventTranslation::Ignore => ConsumeOutcome::Continue,
-        }
-    }
-
-    async fn handle_permission(&self, interrogative_id: &str, question: &str) {
-        info!(interrogative_id = %interrogative_id, "Forwarding permission request to ACP client");
-
-        let options = events::build_permission_options();
-        let tool_call_update = acp::ToolCallUpdate::new(
-            interrogative_id.to_string(),
-            acp::ToolCallUpdateFields::new()
-                .title(question.to_string())
-                .status(acp::ToolCallStatus::Pending),
-        );
-
-        let session_id = acp::SessionId::new(self.session_id.clone());
-        let request = acp::RequestPermissionRequest::new(
-            session_id,
-            tool_call_update,
-            options,
-        );
-
-        match self.conn.request_permission(request).await {
-            Ok(response) => {
-                let granted = events::resolve_permission_outcome(&response.outcome);
-                info!(interrogative_id = %interrogative_id, granted, "Permission response from client");
-
-                // Respond to the daemon
-                if let Err(e) =
-                    Self::respond_interrogative(&self.base_url, &self.bearer_token, interrogative_id, granted)
-                        .await
-                {
-                    error!(error = %e, "Failed to respond to interrogative on daemon");
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Permission request failed");
-                // Default to not granted
-                let _ = Self::respond_interrogative(
-                    &self.base_url,
-                    &self.bearer_token,
-                    interrogative_id,
-                    false,
-                )
-                .await;
-            }
-        }
-    }
-
-    async fn respond_interrogative(
-        base_url: &str,
-        bearer_token: &str,
-        interrogative_id: &str,
-        granted: bool,
-    ) -> anyhow::Result<()> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", bearer_token))
-            .json(&serde_json::json!({"kind": "permission_answer", "granted": granted}))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            warn!(status = %resp.status(), "Interrogative response failed");
-        }
-        Ok(())
     }
 }
 
@@ -519,6 +490,343 @@ enum ConsumeOutcome {
     Continue,
     Done(acp::StopReason),
     Error,
+}
+
+/// Connect to SSE stream and consume events until the turn ends or an error occurs.
+async fn connect_and_consume(
+    events_url: &str,
+    bearer_token: &str,
+    base_url: &str,
+    prompt_id: &str,
+    session_id: &str,
+    conn: &ConnectionTo<Client>,
+) -> ConsumeOutcome {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(events_url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await;
+
+    let response = match response {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            error!(status = %r.status(), "SSE connection returned non-200");
+            return ConsumeOutcome::Error;
+        }
+        Err(e) => {
+            error!(error = %e, "SSE connection failed");
+            return ConsumeOutcome::Error;
+        }
+    };
+
+    debug!("SSE stream connected");
+
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut parser = SseParser::new();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) => {
+                error!(error = %e, "SSE stream error");
+                return ConsumeOutcome::Error;
+            }
+        };
+
+        let data_lines = parser.feed(&chunk);
+        for data in data_lines {
+            match process_sse_event(&data, prompt_id, session_id, base_url, bearer_token, conn)
+                .await
+            {
+                ConsumeOutcome::Done(reason) => return ConsumeOutcome::Done(reason),
+                ConsumeOutcome::Error => return ConsumeOutcome::Error,
+                ConsumeOutcome::Continue => {}
+            }
+        }
+    }
+
+    // Stream ended without message_complete
+    warn!(prompt_id = %prompt_id, "SSE stream ended without explicit turn end");
+    ConsumeOutcome::Done(acp::StopReason::EndTurn)
+}
+
+/// Process a single SSE event and translate it into ACP actions.
+async fn process_sse_event(
+    data: &str,
+    prompt_id: &str,
+    session_id: &str,
+    base_url: &str,
+    bearer_token: &str,
+    conn: &ConnectionTo<Client>,
+) -> ConsumeOutcome {
+    let event = match events::parse_sse_event(data) {
+        Some(e) => e,
+        None => {
+            debug!(data = %data.chars().take(200).collect::<String>(), "Failed to parse SSE event; skipping");
+            return ConsumeOutcome::Continue;
+        }
+    };
+
+    debug!(event_type = ?std::mem::discriminant(&event), "SSE event received");
+
+    // Filter by prompt_id if the event has one
+    if let Some(epid) = events::event_prompt_id(&event)
+        && epid != prompt_id
+    {
+        return ConsumeOutcome::Continue;
+    }
+
+    match events::translate_event(&event) {
+        EventTranslation::Update(update) => {
+            let sid = acp::SessionId::new(session_id.to_string());
+            let notification = acp::SessionNotification::new(sid, update.clone());
+            if let Err(e) = conn.send_notification(notification) {
+                error!(error = %e, "Failed to send session notification");
+            }
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::TurnEnd => ConsumeOutcome::Done(acp::StopReason::EndTurn),
+        EventTranslation::TurnCancelled => ConsumeOutcome::Done(acp::StopReason::Cancelled),
+        EventTranslation::PermissionRequest {
+            interrogative_id,
+            question,
+        } => {
+            handle_permission(
+                conn,
+                &interrogative_id,
+                &question,
+                session_id,
+                base_url,
+                bearer_token,
+            )
+            .await;
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::AskUserQuestion {
+            interrogative_id,
+            payload,
+        } => {
+            handle_ask_user_question(conn, &interrogative_id, &payload, base_url, bearer_token)
+                .await;
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::Ignore => ConsumeOutcome::Continue,
+    }
+}
+
+/// Forward a permission request to the ACP client and relay the response to the daemon.
+async fn handle_permission(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    question: &str,
+    session_id: &str,
+    base_url: &str,
+    bearer_token: &str,
+) {
+    info!(interrogative_id = %interrogative_id, "Forwarding permission request to ACP client");
+
+    let options = events::build_permission_options();
+    let tool_call_update = acp::ToolCallUpdate::new(
+        interrogative_id.to_string(),
+        acp::ToolCallUpdateFields::new()
+            .title(question.to_string())
+            .status(acp::ToolCallStatus::Pending),
+    );
+
+    let sid = acp::SessionId::new(session_id.to_string());
+    let request = acp::RequestPermissionRequest::new(sid, tool_call_update, options);
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+
+    let sent = conn.send_request(request);
+    sent.on_receiving_result(async move |result| {
+        let granted = match result {
+            Ok(response) => events::resolve_permission_outcome(&response.outcome),
+            Err(e) => {
+                error!(error = %e, "Permission request failed");
+                false
+            }
+        };
+
+        info!(interrogative_id = %interrogative_id, granted, "Permission response from client");
+
+        if let Err(e) =
+            respond_interrogative_permission(&base_url, &bearer_token, &interrogative_id, granted)
+                .await
+        {
+            error!(error = %e, "Failed to respond to interrogative on daemon");
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+/// Forward an ask_user_question to the ACP client via ext_method and relay answers.
+async fn handle_ask_user_question(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    payload: &AskUserQuestionPayload,
+    base_url: &str,
+    bearer_token: &str,
+) {
+    info!(
+        interrogative_id = %interrogative_id,
+        question_count = payload.questions.len(),
+        "Forwarding ask_user_question to ACP client"
+    );
+
+    let request_json = serde_json::json!({
+        "interrogative_id": interrogative_id,
+        "questions": payload.questions,
+    });
+
+    let params = match serde_json::value::RawValue::from_string(request_json.to_string()) {
+        Ok(raw) => std::sync::Arc::from(raw),
+        Err(e) => {
+            error!(error = %e, "Failed to serialize ask_user_question params");
+            let _ = cancel_interrogative(base_url, bearer_token, interrogative_id).await;
+            return;
+        }
+    };
+
+    let ext_request = acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(
+        "polytoken/ask_user_question",
+        params,
+    ));
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+
+    let sent = conn.send_request(ext_request);
+    sent.on_receiving_result(async move |result| {
+        match result {
+            Ok(response_value) => {
+                let answers = parse_ask_user_question_answers_value(&response_value);
+
+                if answers.is_empty() {
+                    warn!(
+                        interrogative_id = %interrogative_id,
+                        "No answers from ACP client; cancelling interrogative"
+                    );
+                    let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id).await;
+                    return Ok(());
+                }
+
+                info!(
+                    interrogative_id = %interrogative_id,
+                    answer_count = answers.len(),
+                    "Answers received from ACP client"
+                );
+
+                if let Err(e) =
+                    respond_ask_user_question(&base_url, &bearer_token, &interrogative_id, &answers)
+                        .await
+                {
+                    error!(error = %e, "Failed to respond to ask_user_question on daemon");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    interrogative_id = %interrogative_id,
+                    "ACP client does not support ask_user_question or request failed; cancelling"
+                );
+                let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id).await;
+            }
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+// ---------------------------------------------------------------------------
+// Daemon HTTP helpers (standalone functions for use in spawned tasks)
+// ---------------------------------------------------------------------------
+
+async fn respond_interrogative_permission(
+    base_url: &str,
+    bearer_token: &str,
+    interrogative_id: &str,
+    granted: bool,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .json(&serde_json::json!({"kind": "permission_answer", "granted": granted}))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "Interrogative response failed");
+    }
+    Ok(())
+}
+
+/// Parse the ext_method response from the ACP client into answer replies.
+fn parse_ask_user_question_answers_value(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(obj) => {
+            if let Some(serde_json::Value::Array(answers)) = obj.get("answers") {
+                answers.clone()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// POST `{"kind": "ask_user_question_answers", "answers": [...]}` to the daemon.
+async fn respond_ask_user_question(
+    base_url: &str,
+    bearer_token: &str,
+    interrogative_id: &str,
+    answers: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .json(&serde_json::json!({
+            "kind": "ask_user_question_answers",
+            "answers": answers
+        }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "ask_user_question response failed");
+    }
+    Ok(())
+}
+
+/// POST `{"kind": "cancel"}` to the daemon to cancel a pending interrogative.
+async fn cancel_interrogative(
+    base_url: &str,
+    bearer_token: &str,
+    interrogative_id: &str,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .json(&serde_json::json!({"kind": "cancel"}))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "Interrogative cancel failed");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
