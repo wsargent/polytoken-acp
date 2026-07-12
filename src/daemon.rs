@@ -117,8 +117,8 @@ impl DaemonHandle {
 
         info!(session_id = %session_id, cwd = ?cwd, "Spawning polytoken daemon");
 
-        let mut child = Command::new("polytoken")
-            .arg("daemon")
+        let mut cmd = Command::new("polytoken");
+        cmd.arg("daemon")
             .arg("--project-dir")
             .arg(cwd)
             .arg("--credential-file")
@@ -130,7 +130,14 @@ impl DaemonHandle {
             .arg("--log-dir")
             .arg(&log_dir)
             .arg("--session-id")
-            .arg(&session_id)
+            .arg(&session_id);
+
+        // When resuming, pass --resume so the daemon loads saved history.
+        if resume_session_id.is_some() {
+            cmd.arg("--resume");
+        }
+
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -220,15 +227,15 @@ impl DaemonHandle {
         };
 
         // Verify the daemon is responding
-        for attempt in 0..10 {
+        for attempt in 0..20 {
             if handle.health().await.unwrap_or(false) {
                 info!(session_id = %handle.session_id, "Daemon is healthy");
                 return Ok(handle);
             }
-            if attempt == 9 {
+            if attempt == 19 {
                 let _ = handle.child.as_mut().unwrap().kill().await;
                 bail!(
-                    "Daemon startup.json says ready but /health is not responding after 10 attempts"
+                    "Daemon startup.json says ready but /health is not responding after 20 attempts"
                 );
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
