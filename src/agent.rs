@@ -56,7 +56,10 @@ pub async fn run() {
                     .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
                     .mcp_capabilities(acp::McpCapabilities::new())
                     .session_capabilities(
-                        acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new()),
+                        acp::SessionCapabilities::new()
+                            .list(acp::SessionListCapabilities::new())
+                            .resume(acp::SessionResumeCapabilities::new())
+                            .close(acp::SessionCloseCapabilities::new()),
                     );
                 let resp = acp::InitializeResponse::new(_req.protocol_version)
                     .agent_capabilities(caps)
@@ -81,6 +84,26 @@ pub async fn run() {
                 let state = Arc::clone(&state);
                 async move |req: acp::NewSessionRequest, responder, cx| {
                     handle_new_session(&state, req, responder, cx).await
+                }
+            },
+            on_receive_request!(),
+        )
+        // session/resume
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::ResumeSessionRequest, responder, cx| {
+                    handle_resume_session(&state, req, responder, cx).await
+                }
+            },
+            on_receive_request!(),
+        )
+        // session/close
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::CloseSessionRequest, responder, cx| {
+                    handle_close_session(&state, req, responder, cx).await
                 }
             },
             on_receive_request!(),
@@ -117,8 +140,11 @@ pub async fn run() {
         )
         // set_session_config_option
         .on_receive_request(
-            async |_req: acp::SetSessionConfigOptionRequest, responder, _cx| {
-                responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]))
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::SetSessionConfigOptionRequest, responder, cx| {
+                    handle_set_session_config_option(&state, req, responder, cx).await
+                }
             },
             on_receive_request!(),
         )
@@ -182,9 +208,10 @@ async fn handle_new_session(
         Ok(daemon) => {
             let session_id = daemon.session_id().to_string();
 
-            // Build the session mode state from the daemon's facets.
-            // Polytoken has two facets: "execute" (default) and "plan".
-            let modes = build_session_mode_state(&daemon).await;
+            // Fetch daemon state once, then build modes and config options from it.
+            let daemon_state = daemon.fetch_daemon_state().await;
+            let modes = build_session_mode_state_from_value(&daemon_state);
+            let config_options = build_model_config_options(&daemon_state);
 
             state
                 .lock()
@@ -196,6 +223,9 @@ async fn handle_new_session(
             let mut response = acp::NewSessionResponse::new(session_id);
             if let Some(ms) = modes {
                 response = response.modes(ms);
+            }
+            if !config_options.is_empty() {
+                response = response.config_options(config_options);
             }
             responder.respond(response)
         }
@@ -209,6 +239,94 @@ async fn handle_new_session(
             ))
         }
     }
+}
+
+async fn handle_resume_session(
+    state: &Arc<Mutex<AgentState>>,
+    req: acp::ResumeSessionRequest,
+    responder: agent_client_protocol::Responder<acp::ResumeSessionResponse>,
+    _cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = req.session_id.0.to_string();
+
+    info!(
+        session_id = %session_id,
+        cwd = ?req.cwd,
+        "ACP session/resume"
+    );
+
+    // Check if we already have this session in memory (e.g. resumed twice).
+    {
+        let sessions = state.lock().unwrap();
+        if sessions.sessions.contains_key(&session_id) {
+            return responder.respond_with_error(
+                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                    "error": "Session already exists"
+                })),
+            );
+        }
+    }
+
+    match DaemonHandle::spawn_with_session_id(&req.cwd, Some(&session_id)).await {
+        Ok(daemon) => {
+            let daemon_state = daemon.fetch_daemon_state().await;
+            let modes = build_session_mode_state_from_value(&daemon_state);
+            let config_options = build_model_config_options(&daemon_state);
+
+            state
+                .lock()
+                .unwrap()
+                .sessions
+                .insert(session_id.clone(), daemon);
+
+            info!(session_id = %session_id, "Session resumed");
+            let mut response = acp::ResumeSessionResponse::new();
+            if let Some(ms) = modes {
+                response = response.modes(ms);
+            }
+            if !config_options.is_empty() {
+                response = response.config_options(config_options);
+            }
+            responder.respond(response)
+        }
+        Err(e) => {
+            error!(error = %e, session_id = %session_id, "Failed to resume session");
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({
+                    "error": "Failed to resume polytoken daemon session",
+                    "detail": e.to_string(),
+                }),
+            ))
+        }
+    }
+}
+
+async fn handle_close_session(
+    state: &Arc<Mutex<AgentState>>,
+    req: acp::CloseSessionRequest,
+    responder: agent_client_protocol::Responder<acp::CloseSessionResponse>,
+    _cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = req.session_id.0.to_string();
+    info!(session_id = %session_id, "ACP session/close");
+
+    // Remove the daemon from the map and terminate it.
+    let daemon = {
+        let mut sessions = state.lock().unwrap();
+        sessions.sessions.remove(&session_id)
+    };
+
+    match daemon {
+        Some(mut daemon) => {
+            daemon.terminate().await;
+            info!(session_id = %session_id, "Session closed");
+        }
+        None => {
+            warn!(session_id = %session_id, "session/close: session not found (already closed?)");
+        }
+    }
+
+    responder.respond(acp::CloseSessionResponse::new())
 }
 
 async fn handle_prompt(
@@ -306,8 +424,10 @@ async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotifi
 
 /// Build the ACP SessionModeState from the daemon's current facet and known facets.
 /// Polytoken has two facets: "execute" (default) and "plan".
-async fn build_session_mode_state(daemon: &DaemonHandle) -> Option<acp::SessionModeState> {
-    let active_facet = match daemon.fetch_daemon_state().await {
+fn build_session_mode_state_from_value(
+    state: &Result<serde_json::Value, anyhow::Error>,
+) -> Option<acp::SessionModeState> {
+    let active_facet = match state {
         Ok(state) => state
             .get("active_facet")
             .and_then(|v| v.as_str())
@@ -327,6 +447,67 @@ async fn build_session_mode_state(daemon: &DaemonHandle) -> Option<acp::SessionM
     ];
 
     Some(acp::SessionModeState::new(active_facet, modes))
+}
+
+/// Build the model `SessionConfigOption` from the daemon's `available_models` list.
+///
+/// ACP clients like Paseo look for a select-type config option with
+/// `category: "model"` to populate their model picker. Each option value is
+/// the daemon model name (`AvailableModelEntry.name`), and the label is the
+/// display label (`AvailableModelEntry.label`).
+fn build_model_config_options(
+    state: &Result<serde_json::Value, anyhow::Error>,
+) -> Vec<acp::SessionConfigOption> {
+    let state = match state {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to fetch daemon state for models; skipping model config");
+            return Vec::new();
+        }
+    };
+
+    let active_model = state
+        .get("active_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let available_models = match state.get("available_models").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    if available_models.is_empty() {
+        return Vec::new();
+    }
+
+    let options: Vec<acp::SessionConfigSelectOption> = available_models
+        .iter()
+        .filter_map(|m| {
+            let name = m.get("name").and_then(|v| v.as_str())?.to_string();
+            let label = m
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&name)
+                .to_string();
+            Some(acp::SessionConfigSelectOption::new(name, label))
+        })
+        .collect();
+
+    if options.is_empty() {
+        return Vec::new();
+    }
+
+    // Use the first model name if active_model is empty.
+    let current_value = if active_model.is_empty() {
+        options[0].value.0.to_string()
+    } else {
+        active_model.to_string()
+    };
+
+    let model_option = acp::SessionConfigOption::select("model", "Model", current_value, options)
+        .category(acp::SessionConfigOptionCategory::Model);
+
+    vec![model_option]
 }
 
 async fn handle_list_sessions(
@@ -402,6 +583,88 @@ async fn handle_set_session_mode(
             responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
                 serde_json::json!({
                     "error": "Failed to switch facet",
+                    "detail": e.to_string(),
+                }),
+            ))
+        }
+    }
+}
+
+async fn handle_set_session_config_option(
+    state: &Arc<Mutex<AgentState>>,
+    req: acp::SetSessionConfigOptionRequest,
+    responder: agent_client_protocol::Responder<acp::SetSessionConfigOptionResponse>,
+    _cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = req.session_id.0.to_string();
+    let config_id = req.config_id.0.to_string();
+    let model_value = req.value.as_value_id().map(|v| v.0.as_ref().to_string());
+
+    info!(
+        session_id = %session_id,
+        config_id = %config_id,
+        value = ?model_value,
+        "ACP set_session_config_option"
+    );
+
+    // Only "model" is supported right now.
+    if config_id != "model" {
+        warn!(config_id = %config_id, "Unsupported config option; ignoring");
+        return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
+    }
+
+    let Some(model_name) = model_value else {
+        warn!("Expected value-id for model config option; ignoring");
+        return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
+    };
+
+    let (base_url, bearer) = {
+        let sessions = state.lock().unwrap();
+        match sessions.sessions.get(&session_id) {
+            Some(d) => (d.base_url().to_string(), d.bearer_token().to_string()),
+            None => {
+                return responder.respond_with_error(
+                    agent_client_protocol::Error::internal_error()
+                        .data(serde_json::json!({"error": "Session not found"})),
+                );
+            }
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/model", base_url);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer))
+        .json(&serde_json::json!({ "model": model_name }))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            info!(session_id = %session_id, model = %model_name, "Model switched");
+            // Return empty config_options — the client already knows the
+            // new value since it just set it. A follow-up session update
+            // notification with the full config_options could be sent if
+            // needed, but Paseo doesn't require it.
+            responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]))
+        }
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            error!(status = %status, body = %body, "Failed to switch model");
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({
+                    "error": "Failed to switch model",
+                    "detail": format!("POST /model returned status {}: {}", status, body),
+                }),
+            ))
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to POST /model");
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({
+                    "error": "Failed to switch model",
                     "detail": e.to_string(),
                 }),
             ))
