@@ -505,10 +505,7 @@ fn build_model_config_option(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let available_models = match state.get("available_models").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return None,
-    };
+    let available_models = state.get("available_models").and_then(|v| v.as_array())?;
 
     if available_models.is_empty() {
         return None;
