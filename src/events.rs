@@ -233,9 +233,17 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
         DaemonEvent::ContentBlockDelta { .. } => EventTranslation::Ignore,
 
         // Tool call → ToolCall session update
-        DaemonEvent::ToolCall { call_id, name, .. } => {
-            let tool_call = acp::ToolCall::new(call_id.clone(), name.clone())
+        DaemonEvent::ToolCall {
+            call_id,
+            name,
+            input,
+            ..
+        } => {
+            let mut tool_call = acp::ToolCall::new(call_id.clone(), name.clone())
                 .status(acp::ToolCallStatus::Pending);
+            if let Some(input) = input {
+                tool_call = tool_call.raw_input(input.clone());
+            }
             EventTranslation::Update(acp::SessionUpdate::ToolCall(tool_call))
         }
 
@@ -252,7 +260,11 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                 acp::ToolCallStatus::Completed
             };
             let mut fields = acp::ToolCallUpdateFields::new().status(status);
-            if let Some(c) = content {
+            if let Some(c) = &content {
+                // Try to parse content as JSON for raw_output
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(c) {
+                    fields = fields.raw_output(json_val);
+                }
                 let block: acp::ContentBlock = c.clone().into();
                 fields = fields.content(vec![acp::ToolCallContent::from(block)]);
             }
