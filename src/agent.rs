@@ -237,6 +237,20 @@ async fn handle_new_session(
                 }
             }
 
+            // Send available_commands_update with the daemon's slash commands.
+            if let Some(commands) = build_available_commands() {
+                let sid = acp::SessionId::new(session_id.clone());
+                let notification = acp::SessionNotification::new(
+                    sid,
+                    acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+                        commands,
+                    )),
+                );
+                if let Err(e) = cx.send_notification(notification) {
+                    warn!(error = %e, "Failed to send available_commands_update notification");
+                }
+            }
+
             let mut response = acp::NewSessionResponse::new(session_id);
             if let Some(ms) = &mode_state {
                 response = response.modes(ms.clone());
@@ -503,6 +517,51 @@ fn build_config_options(
     }
 
     options
+}
+
+/// Build the ACP available commands list from `polytoken print-slash-commands`.
+fn build_available_commands() -> Option<Vec<acp::AvailableCommand>> {
+    let output = std::process::Command::new("polytoken")
+        .arg("print-slash-commands")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        warn!(status = ?output.status, "polytoken print-slash-commands failed");
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let commands = json.get("commands")?.as_array()?;
+
+    let acp_commands: Vec<acp::AvailableCommand> = commands
+        .iter()
+        .filter_map(|cmd| {
+            let canonical = cmd.get("canonical")?.as_str()?;
+            let name = canonical.strip_prefix('/').unwrap_or(canonical);
+            let description = cmd.get("description")?.as_str()?;
+            let category = cmd.get("category")?.as_str()?;
+
+            let mut acp_cmd = acp::AvailableCommand::new(name, description);
+            if category == "free-text" || category == "choice" {
+                let hint = if category == "choice" {
+                    "select an option"
+                } else {
+                    "enter text"
+                };
+                acp_cmd = acp_cmd.input(acp::AvailableCommandInput::Unstructured(
+                    acp::UnstructuredCommandInput::new(hint),
+                ));
+            }
+            Some(acp_cmd)
+        })
+        .collect();
+
+    if acp_commands.is_empty() {
+        None
+    } else {
+        Some(acp_commands)
+    }
 }
 
 /// Build the model `SessionConfigOption` from the daemon's `available_models` list.
