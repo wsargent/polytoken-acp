@@ -4,7 +4,7 @@ This document describes the ACP extension methods that `polytoken-acp` sends to 
 
 ## ACP Extension Methods (Protocol)
 
-ACP is an [extensible protocol](https://agentclientprotocol.com/protocol/v1/extensibility). Any JSON-RPC method whose name **begins with an underscore** (`_`) is a vendor-specific extension:
+ACP is an [extensible protocol](https://agentclientprotocol.com/protocol/extensibility). Any JSON-RPC method whose name **begins with an underscore** (`_`) is a vendor-specific extension:
 
 - Names **without** `_` are reserved for ACP itself (including future versions).
 - Names **with** `_` create a vendor namespace, e.g. `_polytoken/ask_user_question`.
@@ -22,7 +22,7 @@ All extension methods use the `_polytoken/` vendor namespace.
 
 ### 1. `_polytoken/ask_user_question` (Extension Request)
 
-Sent when the Polytoken daemon emits an `ask_user_question` interrogative event. This is a **request** — it expects a response containing the user's answers.
+Sent when the Polytoken daemon emits an `ask_user_question` interrogative event. This is a **request** — it expects a response containing the user's answers. See the [Polytool CLI reference](https://docs.polytoken.dev/reference/cli/) for `polytoken event-schema`, which prints the full `DaemonEvent` JSON Schema including interrogative shapes.
 
 **When:** The daemon agent calls `ask_user_question` (structured questions with options, modes, etc.). This cannot be mapped to ACP's standard `session/request_permission`, so it uses an extension request instead.
 
@@ -72,7 +72,7 @@ If the client does not support this extension or returns no answers, polytoken-a
 
 ### 2. `_polytoken/system_reminder` (Extension Notification)
 
-Sent when the Polytoken daemon emits a `system_reminder` event. This is a **notification** — one-way, no response expected.
+Sent when the Polytoken daemon emits a `system_reminder` event. This is a **notification** — one-way, no response expected. The daemon emits these based on its [permission rules and system hooks](https://docs.polytoken.dev/reference/configuration/).
 
 **When:** The daemon injects system reminders (e.g. repository status, repository metadata changed) into the conversation. These are informational and don't require a response.
 
@@ -93,7 +93,7 @@ Sent when the Polytoken daemon emits a `system_reminder` event. This is a **noti
 
 ## Handling Extensions in Paseo
 
-Paseo's base ACP client (`packages/server/src/server/agent/providers/acp-agent.ts`) handles extension methods generically via the `ACPExtensionCommandsParser` type:
+Paseo's base ACP client (`packages/server/src/server/agent/providers/acp-agent.ts`) handles extension methods generically via the `ACPExtensionCommandsParser` type. See the [Paseo custom providers documentation](https://paseo.sh/docs/custom-providers) for how ACP agents are configured and launched:
 
 ```typescript
 export type ACPExtensionCommandsParser = (
@@ -108,7 +108,7 @@ export type ACPExtensionCommandsParser = (
 
 ### Reference Implementation: Kiro
 
-Kiro (`packages/server/src/server/agent/providers/kiro-acp-agent.ts`) registers a parser for `_kiro.dev/commands/available`:
+Kiro (`packages/server/src/server/agent/providers/kiro-acp-agent.ts`) registers a parser for `_kiro.dev/commands/available`. This is the reference implementation for provider-specific extension handling, similar to how Paseo's [providers overview](https://paseo.sh/docs/providers) describes native vs ACP-tier adapter patterns:
 
 ```typescript
 const KIRO_COMMANDS_AVAILABLE_METHOD = "_kiro.dev/commands/available";
@@ -152,3 +152,26 @@ This is a product decision for the Paseo side.
 |--------|------|-----------|-------------------|--------|
 | `_polytoken/ask_user_question` | ext request | daemon → client → daemon | Yes (answers array) | ✅ On main |
 | `_polytoken/system_reminder` | ext notification | daemon → client | No | 🔀 PR #17 |
+
+## References
+
+### ACP (Agent Client Protocol)
+
+- [Protocol Extensibility](https://agentclientprotocol.com/protocol/extensibility) — official spec for underscore-prefixed extension methods, requests vs notifications, and capability advertisement
+- [Protocol Overview](https://agentclientprotocol.com/protocol/v1/overview) — JSON-RPC envelope, built-in extensibility mechanisms
+- [Rust SDK RFD](https://agentclientprotocol.com/rfds/rust-sdk-v1) — describes the `ext_method` / `ext_notification` approach in the current SDK and the planned first-class custom method support
+
+### Polytoken
+
+- [Introduction](https://docs.polytoken.dev/introduction) — what Polytoken is and how the daemon works
+- [CLI Reference](https://docs.polytoken.dev/reference/cli/) — `polytoken event-schema` prints the full `DaemonEvent` JSON Schema; `polytoken print-tools` prints tool documentation
+- [Daemon Authentication](https://docs.polytoken.dev/reference/daemon-auth) — bearer token and HTTP daemon API
+- [Application Configuration](https://docs.polytoken.dev/reference/configuration/) — provider config, permission rules, MCP block lists
+
+### Paseo
+
+- [Providers](https://paseo.sh/docs/providers) — mental model for native vs ACP-tier agent adapters
+- [Custom Providers](https://paseo.sh/docs/custom-providers) — how to add an ACP agent via `extends: "acp"` and `command` in `~/.paseo/config.json`
+- [docs/custom-providers.md on GitHub](https://github.com/getpaseo/paseo/blob/main/docs/custom-providers.md) — full field reference (`extends`, `label`, `command`, `env`, `models`, `additionalModels`, etc.)
+- `packages/server/src/server/agent/providers/acp-agent.ts` — base ACP client with `extNotification()` handler and `ACPExtensionCommandsParser` type
+- `packages/server/src/server/agent/providers/kiro-acp-agent.ts` — reference implementation of a provider-specific extension method parser
