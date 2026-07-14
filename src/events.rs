@@ -424,10 +424,16 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             input,
             ..
         } => {
+            let kind = tool_kind_for_name(name);
             let mut tool_call = acp::ToolCall::new(call_id.clone(), name.clone())
+                .kind(kind)
                 .status(acp::ToolCallStatus::Pending);
             if let Some(input) = input {
                 tool_call = tool_call.raw_input(input.clone());
+                // Extract file locations from input
+                if let Some(locs) = extract_locations(input) {
+                    tool_call = tool_call.locations(locs);
+                }
             }
             EventTranslation::Update(acp::SessionUpdate::ToolCall(tool_call))
         }
@@ -541,6 +547,91 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
         }
 
         _ => EventTranslation::Ignore,
+    }
+}
+
+/// Map a daemon tool name to an ACP `ToolKind`.
+///
+/// This lets the ACP client (Paseo) choose the right UI treatment —
+/// read view for file reads, diff view for edits, shell view for commands,
+/// search results for grep/glob, etc.
+fn tool_kind_for_name(name: &str) -> acp::ToolKind {
+    match name {
+        // File reading
+        "file_read" | "file_read_hashline" => acp::ToolKind::Read,
+
+        // File modification
+        "file_edit_search_replace" | "file_edit_hashline" | "patch_edit" | "file_write" => {
+            acp::ToolKind::Edit
+        }
+
+        // Searching
+        "glob" | "grep" => acp::ToolKind::Search,
+
+        // Shell execution
+        "shell_exec" | "shell_monitor" | "pushd" | "popd" => acp::ToolKind::Execute,
+
+        // Job management (subprocess lifecycle)
+        "job_status" | "job_block" | "job_result" | "job_cancel" => acp::ToolKind::Execute,
+
+        // Web fetching
+        "web_fetch" | "web_search" => acp::ToolKind::Fetch,
+
+        // MCP resource reading
+        "mcp_list_resources" | "mcp_read_resource" => acp::ToolKind::Read,
+
+        // Planning / goal management
+        "write_plan" | "edit_plan" | "handoff_plan" | "propose_goal" | "read_goal"
+        | "complete_goal" | "block_goal" => acp::ToolKind::Think,
+
+        // Todo management (internal reasoning)
+        "todo_create" | "todo_update" | "todo_complete" | "todo_delete" | "todo_list" => {
+            acp::ToolKind::Think
+        }
+
+        // Mode switching
+        "switch_facet" => acp::ToolKind::SwitchMode,
+
+        // Tool search / interaction / delegation
+        "tool_search" | "ask_user_question" | "subagent" | "skill" | "flag_important" => {
+            acp::ToolKind::Other
+        }
+
+        _ => acp::ToolKind::Other,
+    }
+}
+
+/// Extract file locations from a tool call's input JSON.
+///
+/// Looks for common path fields (`path`, `filePath`, `file`, `old_path`,
+/// `new_path`) and returns `ToolCallLocation` entries for each found path.
+fn extract_locations(input: &serde_json::Value) -> Option<Vec<acp::ToolCallLocation>> {
+    let obj = input.as_object()?;
+    let mut locations = Vec::new();
+
+    // Primary path fields
+    for key in &["path", "filePath", "file"] {
+        if let Some(path_str) = obj.get(*key).and_then(|v| v.as_str()) {
+            let mut loc = acp::ToolCallLocation::new(path_str.to_string());
+            if let Some(line) = obj.get("line").or_else(|| obj.get("offset")).and_then(|v| v.as_u64())
+            {
+                loc = loc.line(line as u32);
+            }
+            locations.push(loc);
+        }
+    }
+
+    // Edit tools may have old_path / new_path
+    for key in &["old_path", "new_path"] {
+        if let Some(path_str) = obj.get(*key).and_then(|v| v.as_str()) {
+            locations.push(acp::ToolCallLocation::new(path_str.to_string()));
+        }
+    }
+
+    if locations.is_empty() {
+        None
+    } else {
+        Some(locations)
     }
 }
 
@@ -1155,6 +1246,128 @@ mod tests {
                 assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Completed));
             }
             _ => panic!("Expected ToolCallUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_file_read() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c1".into(),
+            name: "file_read".into(),
+            input: Some(serde_json::json!({"path": "/tmp/test.rs", "line": 10})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Read);
+                assert_eq!(tc.locations.len(), 1);
+                assert_eq!(tc.locations[0].path, std::path::PathBuf::from("/tmp/test.rs"));
+                assert_eq!(tc.locations[0].line, Some(10));
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_file_edit() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c2".into(),
+            name: "file_edit_search_replace".into(),
+            input: Some(serde_json::json!({"path": "/tmp/test.rs"})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Edit);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_shell_exec() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c3".into(),
+            name: "shell_exec".into(),
+            input: Some(serde_json::json!({"command": "ls"})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Execute);
+                // No path fields → no locations
+                assert!(tc.locations.is_empty());
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_grep() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c4".into(),
+            name: "grep".into(),
+            input: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Search);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_web_fetch() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c5".into(),
+            name: "web_fetch".into(),
+            input: Some(serde_json::json!({"url": "https://example.com"})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Fetch);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_switch_facet() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c6".into(),
+            name: "switch_facet".into(),
+            input: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::SwitchMode);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_extract_locations_from_edit() {
+        let input = serde_json::json!({
+            "old_path": "/tmp/old.rs",
+            "new_path": "/tmp/new.rs"
+        });
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c7".into(),
+            name: "patch_edit".into(),
+            input: Some(input),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Edit);
+                assert_eq!(tc.locations.len(), 2);
+            }
+            _ => panic!("Expected ToolCall"),
         }
     }
 }
