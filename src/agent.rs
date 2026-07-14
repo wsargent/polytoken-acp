@@ -272,6 +272,18 @@ async fn handle_new_session(
                 }
             }
 
+            // Send initial Plan (todos) from daemon state.
+            if let Ok(ref ds) = daemon_state
+                && let Some(plan) = events::build_plan_from_state(ds)
+            {
+                let sid = acp::SessionId::new(session_id.clone());
+                let notification =
+                    acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+                if let Err(e) = cx.send_notification(notification) {
+                    warn!(error = %e, "Failed to send initial Plan notification");
+                }
+            }
+
             let mut response = acp::NewSessionResponse::new(session_id);
             if let Some(ms) = &mode_state {
                 response = response.modes(ms.clone());
@@ -1487,6 +1499,57 @@ async fn process_sse_event(
             send_ext_notification(conn, &method, &params);
             ConsumeOutcome::Continue
         }
+        EventTranslation::SystemReminder {
+            slug,
+            display_name,
+            body,
+            reason,
+        } => {
+            let params = serde_json::json!({
+                "slug": slug,
+                "display_name": display_name,
+                "body": body,
+                "reason": reason,
+            });
+            send_ext_notification(conn, "_polytoken/system_reminder", &params);
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::GoalDriverUpdate {
+            transition,
+            summary,
+        } => {
+            let entries = if transition == "cleared" {
+                vec![]
+            } else {
+                vec![acp::PlanEntry::new(
+                    format!("Goal: {}", summary),
+                    acp::PlanEntryPriority::High,
+                    acp::PlanEntryStatus::InProgress,
+                )]
+            };
+            let plan = acp::Plan::new(entries);
+            let sid = acp::SessionId::new(session_id.to_string());
+            let notification = acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+            if let Err(e) = conn.send_notification(notification) {
+                error!(error = %e, "Failed to send goal driver Plan notification");
+            }
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::TodoStateChange => {
+            // Re-fetch /state and send an updated Plan
+            if let Some(plan) = fetch_daemon_state_raw(base_url, bearer_token)
+                .await
+                .and_then(|state| events::build_plan_from_state(&state))
+            {
+                let sid = acp::SessionId::new(session_id.to_string());
+                let notification =
+                    acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+                if let Err(e) = conn.send_notification(notification) {
+                    error!(error = %e, "Failed to send todo Plan notification");
+                }
+            }
+            ConsumeOutcome::Continue
+        }
         EventTranslation::Ignore => ConsumeOutcome::Continue,
     }
 }
@@ -1751,6 +1814,25 @@ async fn handle_ask_user_question(
 // ---------------------------------------------------------------------------
 // Daemon HTTP helpers (standalone functions for use in spawned tasks)
 // ---------------------------------------------------------------------------
+
+/// Fetch the daemon's `/state` as raw JSON.
+///
+/// Used by TodoStateChange to re-fetch todos and build an updated Plan.
+async fn fetch_daemon_state_raw(base_url: &str, bearer_token: &str) -> Option<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/state", base_url);
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "Failed to fetch /state for todo plan");
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
 
 /// Fetch context usage from the daemon's `/state` endpoint and convert to ACP `UsageUpdate`.
 async fn fetch_context_usage(base_url: &str, bearer_token: &str) -> Option<acp::UsageUpdate> {

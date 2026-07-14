@@ -144,6 +144,34 @@ pub enum DaemonEvent {
         #[serde(default)]
         subagent_handle: Option<String>,
     },
+    #[serde(rename = "session_state_changed")]
+    SessionStateChanged {
+        #[serde(default)]
+        domains: Vec<String>,
+    },
+    #[serde(rename = "todo_status_nudge")]
+    TodoStatusNudge,
+    #[serde(rename = "goal_driver_update")]
+    GoalDriverUpdate {
+        transition: String,
+        #[serde(default)]
+        goal: Option<serde_json::Value>,
+        #[serde(default)]
+        proposed_summary: Option<String>,
+    },
+    #[serde(rename = "system_reminder")]
+    SystemReminder {
+        slug: String,
+        display_name: String,
+        body: String,
+        reason: serde_json::Value,
+    },
+    #[serde(rename = "usage_throttle")]
+    UsageThrottle {
+        #[serde(default)]
+        prompt_id: Option<String>,
+        provider: String,
+    },
     #[serde(rename = "heartbeat")]
     Heartbeat,
     #[serde(other)]
@@ -278,6 +306,17 @@ pub enum EventTranslation {
         subagent_handle: Option<String>,
         exit_code: Option<i32>,
     },
+    /// A system reminder — forward as ext notification.
+    SystemReminder {
+        slug: String,
+        display_name: String,
+        body: String,
+        reason: serde_json::Value,
+    },
+    /// A goal driver update — forward as ACP Plan.
+    GoalDriverUpdate { transition: String, summary: String },
+    /// Re-fetch /state for todo/plan updates.
+    TodoStateChange,
     /// Nothing to send (heartbeat, unknown, etc.)
     Ignore,
 }
@@ -306,6 +345,11 @@ pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
         DaemonEvent::JobExpiring { .. } => "job_expiring",
         DaemonEvent::JobCancelled { .. } => "job_cancelled",
         DaemonEvent::JobUpdated { .. } => "job_updated",
+        DaemonEvent::SessionStateChanged { .. } => "session_state_changed",
+        DaemonEvent::TodoStatusNudge => "todo_status_nudge",
+        DaemonEvent::GoalDriverUpdate { .. } => "goal_driver_update",
+        DaemonEvent::SystemReminder { .. } => "system_reminder",
+        DaemonEvent::UsageThrottle { .. } => "usage_throttle",
         DaemonEvent::Heartbeat => "heartbeat",
         DaemonEvent::Other => "unknown",
     }
@@ -480,6 +524,27 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
         } => {
             format!("job_id={} subagent={:?}", job_id, subagent_handle)
         }
+        DaemonEvent::SessionStateChanged { domains } => format!("domains={:?}", domains),
+        DaemonEvent::TodoStatusNudge => String::new(),
+        DaemonEvent::GoalDriverUpdate {
+            transition,
+            goal,
+            proposed_summary,
+        } => {
+            let summary = goal
+                .as_ref()
+                .and_then(|g| g.get("summary"))
+                .and_then(|s| s.as_str())
+                .or(proposed_summary.as_deref())
+                .unwrap_or("");
+            format!("transition={} summary={}", transition, summary)
+        }
+        DaemonEvent::SystemReminder {
+            slug, display_name, ..
+        } => {
+            format!("slug={} name={}", slug, display_name)
+        }
+        DaemonEvent::UsageThrottle { provider, .. } => format!("provider={}", provider),
         DaemonEvent::Heartbeat => String::new(),
         DaemonEvent::Other => String::new(),
     }
@@ -756,6 +821,67 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             subagent_handle,
         } => translate_job_event(job_id, "job_updated", subagent_handle, None),
 
+        // Session state changed → re-fetch /state for todo updates if domains include todos
+        DaemonEvent::SessionStateChanged { domains } => {
+            if domains.iter().any(|d| d == "todos") {
+                debug!(domains = ?domains, "Session state changed (todos); will re-fetch /state");
+                EventTranslation::TodoStateChange
+            } else {
+                debug!(domains = ?domains, "Session state changed (non-todos); ignoring");
+                EventTranslation::Ignore
+            }
+        }
+        DaemonEvent::TodoStatusNudge => {
+            debug!("Todo status nudge; will re-fetch /state");
+            EventTranslation::TodoStateChange
+        }
+
+        // Goal driver update → ACP Plan
+        DaemonEvent::GoalDriverUpdate {
+            transition,
+            goal,
+            proposed_summary,
+        } => {
+            let summary = goal
+                .as_ref()
+                .and_then(|g| g.get("summary"))
+                .and_then(|s| s.as_str())
+                .or(proposed_summary.as_deref())
+                .unwrap_or("");
+            if summary.is_empty() && transition != "cleared" {
+                debug!(transition = %transition, "Goal driver update with no summary; ignoring");
+                EventTranslation::Ignore
+            } else {
+                debug!(transition = %transition, summary = %summary, "Goal driver update");
+                EventTranslation::GoalDriverUpdate {
+                    transition: transition.clone(),
+                    summary: summary.to_string(),
+                }
+            }
+        }
+
+        // System reminder → ext notification
+        DaemonEvent::SystemReminder {
+            slug,
+            display_name,
+            body,
+            reason,
+        } => {
+            debug!(slug = %slug, "System reminder");
+            EventTranslation::SystemReminder {
+                slug: slug.clone(),
+                display_name: display_name.clone(),
+                body: body.clone(),
+                reason: reason.clone(),
+            }
+        }
+
+        // Usage throttle → logged but not forwarded (context_pressure handles mid-turn usage)
+        DaemonEvent::UsageThrottle { provider, .. } => {
+            debug!(provider = %provider, "Usage throttle (logged, not forwarded)");
+            EventTranslation::Ignore
+        }
+
         _ => EventTranslation::Ignore,
     }
 }
@@ -875,6 +1001,48 @@ fn extract_locations(input: &serde_json::Value) -> Option<Vec<acp::ToolCallLocat
     } else {
         Some(locations)
     }
+}
+
+/// Build an ACP Plan from the daemon's `/state` todos.
+///
+/// Maps each todo to a `PlanEntry` with:
+/// - `PlanEntryState::Completed` for `done` todos
+/// - `PlanEntryState::Pending` for everything else
+/// - Priority `High` for `blocked`/`in_progress`, `Medium` otherwise
+pub fn build_plan_from_state(state: &serde_json::Value) -> Option<acp::Plan> {
+    let todos = state.get("todos")?.as_array()?;
+    if todos.is_empty() {
+        return None;
+    }
+
+    let entries: Vec<acp::PlanEntry> = todos
+        .iter()
+        .map(|todo| {
+            let title = todo
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
+            let status = todo
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending");
+            let plan_status = if status == "done" {
+                acp::PlanEntryStatus::Completed
+            } else if status == "in_progress" {
+                acp::PlanEntryStatus::InProgress
+            } else {
+                acp::PlanEntryStatus::Pending
+            };
+            let priority = if status == "blocked" || status == "in_progress" {
+                acp::PlanEntryPriority::High
+            } else {
+                acp::PlanEntryPriority::Medium
+            };
+            acp::PlanEntry::new(title.to_string(), priority, plan_status)
+        })
+        .collect();
+
+    Some(acp::Plan::new(entries))
 }
 
 /// Build the ACP permission options for a permission request.
@@ -1908,6 +2076,159 @@ mod tests {
         match translate_event(&evt) {
             EventTranslation::Ignore => {}
             _ => panic!("Expected Ignore for subagent job (dedup)"),
+        }
+    }
+
+    #[test]
+    fn test_build_plan_from_state() {
+        let state = serde_json::json!({
+            "todos": [
+                {"id": 1, "title": "Write code", "status": "in_progress", "dependencies": []},
+                {"id": 2, "title": "Write tests", "status": "pending", "dependencies": [1]},
+                {"id": 3, "title": "Review", "status": "done", "dependencies": [2]},
+            ]
+        });
+        let plan = build_plan_from_state(&state).expect("plan should exist");
+        assert_eq!(plan.entries.len(), 3);
+        assert_eq!(plan.entries[0].content, "Write code");
+        assert_eq!(plan.entries[0].status, acp::PlanEntryStatus::InProgress);
+        assert_eq!(plan.entries[0].priority, acp::PlanEntryPriority::High);
+        assert_eq!(plan.entries[1].status, acp::PlanEntryStatus::Pending);
+        assert_eq!(plan.entries[2].status, acp::PlanEntryStatus::Completed);
+    }
+
+    #[test]
+    fn test_build_plan_from_state_empty() {
+        let state = serde_json::json!({"todos": []});
+        assert!(build_plan_from_state(&state).is_none());
+    }
+
+    #[test]
+    fn test_translate_goal_driver_update() {
+        let evt = DaemonEvent::GoalDriverUpdate {
+            transition: "accepted".into(),
+            goal: Some(serde_json::json!({"summary": "Ship the feature"})),
+            proposed_summary: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::GoalDriverUpdate {
+                transition,
+                summary,
+            } => {
+                assert_eq!(transition, "accepted");
+                assert_eq!(summary, "Ship the feature");
+            }
+            _ => panic!("Expected GoalDriverUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_translate_goal_driver_update_cleared() {
+        let evt = DaemonEvent::GoalDriverUpdate {
+            transition: "cleared".into(),
+            goal: None,
+            proposed_summary: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::GoalDriverUpdate {
+                transition,
+                summary,
+            } => {
+                assert_eq!(transition, "cleared");
+                assert!(summary.is_empty());
+            }
+            _ => panic!("Expected GoalDriverUpdate for cleared"),
+        }
+    }
+
+    #[test]
+    fn test_translate_system_reminder() {
+        let evt = DaemonEvent::SystemReminder {
+            slug: "repo-status".into(),
+            display_name: "Repository status".into(),
+            body: "clean".into(),
+            reason: serde_json::json!({"type": "repository_status"}),
+        };
+        match translate_event(&evt) {
+            EventTranslation::SystemReminder {
+                slug,
+                display_name,
+                body,
+                ..
+            } => {
+                assert_eq!(slug, "repo-status");
+                assert_eq!(display_name, "Repository status");
+                assert_eq!(body, "clean");
+            }
+            _ => panic!("Expected SystemReminder"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_system_reminder() {
+        let json = r#"{"type":"system_reminder","slug":"repo-status","display_name":"Repository status","body":"clean","reason":{"type":"repository_status"}}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::SystemReminder {
+                slug,
+                display_name,
+                body,
+                ..
+            } => {
+                assert_eq!(slug, "repo-status");
+                assert_eq!(display_name, "Repository status");
+                assert_eq!(body, "clean");
+            }
+            _ => panic!("Expected SystemReminder"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_goal_driver_update() {
+        let json = r#"{"type":"goal_driver_update","transition":"accepted","goal":{"summary":"Ship it"},"proposed_summary":null}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::GoalDriverUpdate {
+                transition, goal, ..
+            } => {
+                assert_eq!(transition, "accepted");
+                assert_eq!(goal.unwrap()["summary"], "Ship it");
+            }
+            _ => panic!("Expected GoalDriverUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_session_state_changed() {
+        let json = r#"{"type":"session_state_changed","domains":["todos"]}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::SessionStateChanged { domains } => {
+                assert_eq!(domains, vec!["todos"]);
+            }
+            _ => panic!("Expected SessionStateChanged"),
+        }
+    }
+
+    #[test]
+    fn test_translate_session_state_changed_todos() {
+        let evt = DaemonEvent::SessionStateChanged {
+            domains: vec!["todos".into()],
+        };
+        match translate_event(&evt) {
+            EventTranslation::TodoStateChange => {}
+            _ => panic!("Expected TodoStateChange for todos domain"),
+        }
+    }
+
+    #[test]
+    fn test_translate_session_state_changed_non_todos() {
+        let evt = DaemonEvent::SessionStateChanged {
+            domains: vec!["flags".into()],
+        };
+        match translate_event(&evt) {
+            EventTranslation::Ignore => {}
+            _ => panic!("Expected Ignore for non-todos domain"),
         }
     }
 }
