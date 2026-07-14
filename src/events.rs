@@ -667,13 +667,69 @@ pub fn resolve_permission_outcome(outcome: &acp::RequestPermissionOutcome) -> bo
 // Content block text extraction (from ACP prompt)
 // ---------------------------------------------------------------------------
 
-/// Extract joined text from ACP ContentBlock array.
+/// Extract joined text from ACP ContentBlock array, converting non-text blocks
+/// to descriptive placeholders (since the daemon only accepts plain text).
+///
+/// - `Text` blocks are joined directly.
+/// - `Image` blocks become `[image: <mime_type>, <size> bytes]`.
+/// - `ResourceLink` blocks become `[resource: <uri>]` (or `[resource: <name>] (<uri>)`).
+/// - `Resource` blocks become `[embedded resource: <mime_type>]`.
+/// - `Audio` blocks become `[audio: <mime_type>, <size> bytes]`.
 pub fn extract_text(blocks: &[acp::ContentBlock]) -> String {
+    use tracing::warn;
+
     blocks
         .iter()
-        .filter_map(|block| match block {
-            acp::ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
+        .map(|block| match block {
+            acp::ContentBlock::Text(text) => text.text.clone(),
+            acp::ContentBlock::Image(img) => {
+                let size = img.data.len();
+                warn!(
+                    mime_type = %img.mime_type,
+                    bytes = size,
+                    "Image content block in prompt — daemon only accepts text; converting to placeholder"
+                );
+                format!("[image: {}, {} bytes]", img.mime_type, size)
+            }
+            acp::ContentBlock::ResourceLink(link) => {
+                warn!(
+                    uri = %link.uri,
+                    "ResourceLink content block in prompt — daemon only accepts text; converting to placeholder"
+                );
+                match &link.title {
+                    Some(title) => format!("[resource: {}] ({})", title, link.uri),
+                    None => format!("[resource: {}]", link.uri),
+                }
+            }
+            acp::ContentBlock::Resource(resource) => {
+                let mime = match &resource.resource {
+                    acp::EmbeddedResourceResource::TextResourceContents(t) => {
+                        t.mime_type.as_deref().unwrap_or("text/plain")
+                    }
+                    acp::EmbeddedResourceResource::BlobResourceContents(b) => {
+                        b.mime_type.as_deref().unwrap_or("application/octet-stream")
+                    }
+                    _ => "unknown",
+                };
+                warn!(
+                    mime_type = mime,
+                    "Embedded resource in prompt — daemon only accepts text; converting to placeholder"
+                );
+                format!("[embedded resource: {}]", mime)
+            }
+            acp::ContentBlock::Audio(audio) => {
+                let size = audio.data.len();
+                warn!(
+                    mime_type = %audio.mime_type,
+                    bytes = size,
+                    "Audio content block in prompt — daemon only accepts text; converting to placeholder"
+                );
+                format!("[audio: {}, {} bytes]", audio.mime_type, size)
+            }
+            _ => {
+                warn!("Unknown content block type in prompt — dropping");
+                String::new()
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -949,6 +1005,37 @@ mod tests {
     fn test_extract_text_empty() {
         let blocks: Vec<acp::ContentBlock> = vec![];
         assert_eq!(extract_text(&blocks), "");
+    }
+
+    #[test]
+    fn test_extract_text_with_image() {
+        let blocks = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("Look at this: ")),
+            acp::ContentBlock::Image(acp::ImageContent::new("iVBORw...", "image/png")),
+        ];
+        let result = extract_text(&blocks);
+        assert!(result.contains("Look at this:"));
+        assert!(result.contains("[image: image/png,"));
+    }
+
+    #[test]
+    fn test_extract_text_with_resource_link() {
+        let blocks = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("See file: ")),
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new("main.rs", "file:///src/main.rs")),
+        ];
+        let result = extract_text(&blocks);
+        assert!(result.contains("See file:"));
+        assert!(result.contains("[resource: file:///src/main.rs]"));
+    }
+
+    #[test]
+    fn test_extract_text_with_resource_link_title() {
+        let link = acp::ResourceLink::new("main.rs", "file:///src/main.rs")
+            .title("Main Source");
+        let blocks = vec![acp::ContentBlock::ResourceLink(link)];
+        let result = extract_text(&blocks);
+        assert!(result.contains("[resource: Main Source] (file:///src/main.rs)"));
     }
 
     // ask_user_question tests
