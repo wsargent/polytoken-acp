@@ -11,6 +11,14 @@ mod events;
 use tracing::info;
 
 fn main() {
+    // Handle --version / -V before anything else — Paseo calls this in its
+    // diagnostic check and expects a quick exit, not an ACP server startup.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("polytoken-acp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // Initialize tracing — output goes to stderr ONLY (stdout is JSON-RPC)
     // All logs are structured JSON (one object per line) for machine consumption.
     //
