@@ -57,6 +57,8 @@ pub async fn run() {
                     serde_json::json!({
                         "ask_user_question": true,
                         "system_reminder": true,
+                        "subagent_started": true,
+                        "subagent_completed": true,
                     }),
                 );
                 let caps = acp::AgentCapabilities::new()
@@ -1263,6 +1265,60 @@ async fn process_sse_event(
                 .await;
             ConsumeOutcome::Continue
         }
+        EventTranslation::SubagentStarted {
+            handle,
+            subagent_type,
+            model,
+        } => {
+            // 1. Send standard ACP ToolCall so Paseo renders it in the timeline.
+            let tool_call = acp::ToolCall::new(handle.clone(), subagent_type.clone())
+                .kind(acp::ToolKind::Think)
+                .status(acp::ToolCallStatus::InProgress);
+            let sid = acp::SessionId::new(session_id.to_string());
+            let notification =
+                acp::SessionNotification::new(sid, acp::SessionUpdate::ToolCall(tool_call));
+            if let Err(e) = conn.send_notification(notification) {
+                error!(error = %e, "Failed to send subagent_started ToolCall notification");
+            }
+
+            // 2. Send extension notification with full metadata (model, type).
+            let params = serde_json::json!({
+                "handle": handle,
+                "subagent_type": subagent_type,
+                "model": model,
+            });
+            send_ext_notification(conn, "_polytoken/subagent_started", &params);
+
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::SubagentCompleted {
+            handle,
+            result_summary,
+        } => {
+            // 1. Send standard ACP ToolCallUpdate so Paseo marks it complete.
+            let mut fields =
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed);
+            if let Some(summary) = &result_summary {
+                let block: acp::ContentBlock = summary.clone().into();
+                fields = fields.content(vec![acp::ToolCallContent::from(block)]);
+            }
+            let update = acp::ToolCallUpdate::new(handle.clone(), fields);
+            let sid = acp::SessionId::new(session_id.to_string());
+            let notification =
+                acp::SessionNotification::new(sid, acp::SessionUpdate::ToolCallUpdate(update));
+            if let Err(e) = conn.send_notification(notification) {
+                error!(error = %e, "Failed to send subagent_completed ToolCallUpdate notification");
+            }
+
+            // 2. Send extension notification with full metadata.
+            let params = serde_json::json!({
+                "handle": handle,
+                "result_summary": result_summary,
+            });
+            send_ext_notification(conn, "_polytoken/subagent_completed", &params);
+
+            ConsumeOutcome::Continue
+        }
         EventTranslation::Ignore => ConsumeOutcome::Continue,
     }
 }
@@ -1417,6 +1473,24 @@ async fn handle_interrogative(
         Ok(())
     })
     .expect("on_receiving_result failed");
+}
+
+/// Send a one-way ACP extension notification (method name starts with `_`).
+///
+/// Extension notifications are best-effort: if the client doesn't recognize
+/// the method, it silently ignores it (per the ACP extensibility spec).
+fn send_ext_notification(conn: &ConnectionTo<Client>, method: &str, params: &serde_json::Value) {
+    let raw = match serde_json::value::RawValue::from_string(params.to_string()) {
+        Ok(raw) => std::sync::Arc::from(raw),
+        Err(e) => {
+            error!(error = %e, method, "Failed to serialize ext notification params");
+            return;
+        }
+    };
+    let ext_notif = acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(method, raw));
+    // Extension notifications are fire-and-forget. If the client doesn't
+    // recognize the method it silently ignores it (per the ACP spec).
+    let _ = conn.send_request(ext_notif);
 }
 
 /// Forward an ask_user_question to the ACP client via ext_method and relay answers.

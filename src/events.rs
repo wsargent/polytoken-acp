@@ -101,6 +101,18 @@ pub enum DaemonEvent {
     SessionTitleChanged { title: String },
     #[serde(rename = "facet_changed")]
     FacetChanged { facet: String },
+    #[serde(rename = "subagent_started")]
+    SubagentStarted {
+        handle: String,
+        subagent_type: String,
+        model: String,
+    },
+    #[serde(rename = "subagent_completed")]
+    SubagentCompleted {
+        handle: String,
+        #[serde(default)]
+        result_summary: Option<String>,
+    },
     #[serde(rename = "heartbeat")]
     Heartbeat,
     #[serde(other)]
@@ -214,6 +226,17 @@ pub enum EventTranslation {
         interrogative_id: String,
         payload: AskUserQuestionPayload,
     },
+    /// A subagent started — emit a ToolCall + extension notification.
+    SubagentStarted {
+        handle: String,
+        subagent_type: String,
+        model: String,
+    },
+    /// A subagent completed — emit a ToolCallUpdate + extension notification.
+    SubagentCompleted {
+        handle: String,
+        result_summary: Option<String>,
+    },
     /// Nothing to send (heartbeat, unknown, etc.)
     Ignore,
 }
@@ -235,6 +258,8 @@ pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
         DaemonEvent::ModelChanged { .. } => "model_changed",
         DaemonEvent::SessionTitleChanged { .. } => "session_title_changed",
         DaemonEvent::FacetChanged { .. } => "facet_changed",
+        DaemonEvent::SubagentStarted { .. } => "subagent_started",
+        DaemonEvent::SubagentCompleted { .. } => "subagent_completed",
         DaemonEvent::Heartbeat => "heartbeat",
         DaemonEvent::Other => "unknown",
     }
@@ -363,6 +388,18 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
         DaemonEvent::ModelChanged { model } => format!("model={}", model),
         DaemonEvent::SessionTitleChanged { title } => format!("title={}", title),
         DaemonEvent::FacetChanged { facet } => format!("facet={}", facet),
+        DaemonEvent::SubagentStarted {
+            handle,
+            subagent_type,
+            model,
+        } => format!("handle={} type={} model={}", handle, subagent_type, model),
+        DaemonEvent::SubagentCompleted {
+            handle,
+            result_summary,
+        } => {
+            let summary = result_summary.as_deref().unwrap_or("(none)");
+            format!("handle={} summary={}", handle, summary)
+        }
         DaemonEvent::Heartbeat => String::new(),
         DaemonEvent::Other => String::new(),
     }
@@ -587,6 +624,32 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             debug!(facet = %facet, "Facet changed; forwarding as current_mode_update");
             let mode_update = acp::CurrentModeUpdate::new(facet.clone());
             EventTranslation::Update(acp::SessionUpdate::CurrentModeUpdate(mode_update))
+        }
+
+        // Subagent started → emit as ToolCall + extension notification
+        DaemonEvent::SubagentStarted {
+            handle,
+            subagent_type,
+            model,
+        } => {
+            debug!(handle = %handle, subagent_type = %subagent_type, "Subagent started");
+            EventTranslation::SubagentStarted {
+                handle: handle.clone(),
+                subagent_type: subagent_type.clone(),
+                model: model.clone(),
+            }
+        }
+
+        // Subagent completed → emit as ToolCallUpdate + extension notification
+        DaemonEvent::SubagentCompleted {
+            handle,
+            result_summary,
+        } => {
+            debug!(handle = %handle, "Subagent completed");
+            EventTranslation::SubagentCompleted {
+                handle: handle.clone(),
+                result_summary: result_summary.clone(),
+            }
         }
 
         _ => EventTranslation::Ignore,
@@ -1509,6 +1572,95 @@ mod tests {
                 assert_eq!(tc.locations.len(), 2);
             }
             _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_subagent_started() {
+        let json = r#"{"type":"subagent_started","handle":"general-purpose:abc","subagent_type":"general-purpose","model":"zai/glm-5.2"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::SubagentStarted {
+                handle,
+                subagent_type,
+                model,
+            } => {
+                assert_eq!(handle, "general-purpose:abc");
+                assert_eq!(subagent_type, "general-purpose");
+                assert_eq!(model, "zai/glm-5.2");
+            }
+            _ => panic!("Expected SubagentStarted"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_subagent_completed() {
+        let json = r#"{"type":"subagent_completed","handle":"general-purpose:abc","result_summary":"Done"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::SubagentCompleted {
+                handle,
+                result_summary,
+            } => {
+                assert_eq!(handle, "general-purpose:abc");
+                assert_eq!(result_summary.as_deref(), Some("Done"));
+            }
+            _ => panic!("Expected SubagentCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_subagent_completed_no_summary() {
+        let json = r#"{"type":"subagent_completed","handle":"general-purpose:abc"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::SubagentCompleted {
+                handle,
+                result_summary,
+            } => {
+                assert_eq!(handle, "general-purpose:abc");
+                assert!(result_summary.is_none());
+            }
+            _ => panic!("Expected SubagentCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_translate_subagent_started() {
+        let evt = DaemonEvent::SubagentStarted {
+            handle: "general-purpose:abc".into(),
+            subagent_type: "general-purpose".into(),
+            model: "zai/glm-5.2".into(),
+        };
+        match translate_event(&evt) {
+            EventTranslation::SubagentStarted {
+                handle,
+                subagent_type,
+                model,
+            } => {
+                assert_eq!(handle, "general-purpose:abc");
+                assert_eq!(subagent_type, "general-purpose");
+                assert_eq!(model, "zai/glm-5.2");
+            }
+            _ => panic!("Expected SubagentStarted translation"),
+        }
+    }
+
+    #[test]
+    fn test_translate_subagent_completed() {
+        let evt = DaemonEvent::SubagentCompleted {
+            handle: "general-purpose:abc".into(),
+            result_summary: Some("All done".into()),
+        };
+        match translate_event(&evt) {
+            EventTranslation::SubagentCompleted {
+                handle,
+                result_summary,
+            } => {
+                assert_eq!(handle, "general-purpose:abc");
+                assert_eq!(result_summary.as_deref(), Some("All done"));
+            }
+            _ => panic!("Expected SubagentCompleted translation"),
         }
     }
 }
