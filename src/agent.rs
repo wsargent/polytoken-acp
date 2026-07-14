@@ -1221,9 +1221,14 @@ async fn handle_interrogative(
         );
 
         // Map the ACP permission outcome to the appropriate daemon response kind.
-        if let Err(e) =
-            respond_interrogative_generic(&base_url, &bearer_token, &interrogative_id, &interrogative_type, granted)
-                .await
+        if let Err(e) = respond_interrogative_generic(
+            &base_url,
+            &bearer_token,
+            &interrogative_id,
+            &interrogative_type,
+            granted,
+        )
+        .await
         {
             error!(error = %e, "Failed to respond to interrogative on daemon");
         }

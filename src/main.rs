@@ -26,8 +26,9 @@ fn main() {
         .with_writer(std::io::stderr)
         .json()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,polytoken_acp::conv=info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,polytoken_acp::conv=info")
+            }),
         )
         .init();
 

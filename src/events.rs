@@ -245,10 +245,18 @@ pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
 pub fn event_summary(evt: &DaemonEvent) -> String {
     match evt {
         DaemonEvent::MessageStart { prompt_id } => format!("prompt_id={}", prompt_id),
-        DaemonEvent::ContentBlockStart { prompt_id, block_index, .. } => {
+        DaemonEvent::ContentBlockStart {
+            prompt_id,
+            block_index,
+            ..
+        } => {
             format!("prompt_id={} block_index={}", prompt_id, block_index)
         }
-        DaemonEvent::ContentBlockDelta { prompt_id, block_index, delta } => {
+        DaemonEvent::ContentBlockDelta {
+            prompt_id,
+            block_index,
+            delta,
+        } => {
             let delta_desc = match delta {
                 BlockDeltaPayload::TextDelta { text } => {
                     let preview: String = text.chars().take(80).collect();
@@ -270,15 +278,27 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
                 }
                 BlockDeltaPayload::Other => "other_delta".to_string(),
             };
-            format!("prompt_id={} block_index={} {}", prompt_id, block_index, delta_desc)
+            format!(
+                "prompt_id={} block_index={} {}",
+                prompt_id, block_index, delta_desc
+            )
         }
-        DaemonEvent::ContentBlockStop { prompt_id, block_index } => {
+        DaemonEvent::ContentBlockStop {
+            prompt_id,
+            block_index,
+        } => {
             format!("prompt_id={} block_index={}", prompt_id, block_index)
         }
         DaemonEvent::MessageComplete { prompt_id } => format!("prompt_id={}", prompt_id),
         DaemonEvent::TurnCancelled { prompt_id } => format!("prompt_id={}", prompt_id),
         DaemonEvent::ModelError { prompt_id } => format!("prompt_id={}", prompt_id),
-        DaemonEvent::ToolCall { prompt_id, call_id, name, input, .. } => {
+        DaemonEvent::ToolCall {
+            prompt_id,
+            call_id,
+            name,
+            input,
+            ..
+        } => {
             let input_desc = match input {
                 Some(v) => {
                     let s = serde_json::to_string(v).unwrap_or_default();
@@ -287,9 +307,19 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
                 }
                 None => String::new(),
             };
-            format!("prompt_id={} call_id={} name={}{}", prompt_id, call_id, name, input_desc)
+            format!(
+                "prompt_id={} call_id={} name={}{}",
+                prompt_id, call_id, name, input_desc
+            )
         }
-        DaemonEvent::ToolResult { prompt_id, call_id, content, content_full, is_error, .. } => {
+        DaemonEvent::ToolResult {
+            prompt_id,
+            call_id,
+            content,
+            content_full,
+            is_error,
+            ..
+        } => {
             let content_desc = if let Some(c) = content_full.as_ref().or(content.as_ref()) {
                 let preview: String = c.chars().take(120).collect();
                 format!(" content={}", preview)
@@ -304,17 +334,30 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
                 content_desc
             )
         }
-        DaemonEvent::Interrogative { prompt_id, interrogative_id, question, interrogative_type, .. } => {
+        DaemonEvent::Interrogative {
+            prompt_id,
+            interrogative_id,
+            question,
+            interrogative_type,
+            ..
+        } => {
             let preview: String = question.chars().take(100).collect();
             format!(
                 "prompt_id={} id={} type={} question={:?}",
                 prompt_id, interrogative_id, interrogative_type, preview
             )
         }
-        DaemonEvent::AskUserQuestion { prompt_id, interrogative_id, payload, .. } => {
+        DaemonEvent::AskUserQuestion {
+            prompt_id,
+            interrogative_id,
+            payload,
+            ..
+        } => {
             format!(
                 "prompt_id={} id={} questions={}",
-                prompt_id, interrogative_id, payload.questions.len()
+                prompt_id,
+                interrogative_id,
+                payload.questions.len()
             )
         }
         DaemonEvent::ModelChanged { model } => format!("model={}", model),
@@ -613,7 +656,10 @@ fn extract_locations(input: &serde_json::Value) -> Option<Vec<acp::ToolCallLocat
     for key in &["path", "filePath", "file"] {
         if let Some(path_str) = obj.get(*key).and_then(|v| v.as_str()) {
             let mut loc = acp::ToolCallLocation::new(path_str.to_string());
-            if let Some(line) = obj.get("line").or_else(|| obj.get("offset")).and_then(|v| v.as_u64())
+            if let Some(line) = obj
+                .get("line")
+                .or_else(|| obj.get("offset"))
+                .and_then(|v| v.as_u64())
             {
                 loc = loc.line(line as u32);
             }
@@ -1022,7 +1068,10 @@ mod tests {
     fn test_extract_text_with_resource_link() {
         let blocks = vec![
             acp::ContentBlock::Text(acp::TextContent::new("See file: ")),
-            acp::ContentBlock::ResourceLink(acp::ResourceLink::new("main.rs", "file:///src/main.rs")),
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                "main.rs",
+                "file:///src/main.rs",
+            )),
         ];
         let result = extract_text(&blocks);
         assert!(result.contains("See file:"));
@@ -1031,8 +1080,7 @@ mod tests {
 
     #[test]
     fn test_extract_text_with_resource_link_title() {
-        let link = acp::ResourceLink::new("main.rs", "file:///src/main.rs")
-            .title("Main Source");
+        let link = acp::ResourceLink::new("main.rs", "file:///src/main.rs").title("Main Source");
         let blocks = vec![acp::ContentBlock::ResourceLink(link)];
         let result = extract_text(&blocks);
         assert!(result.contains("[resource: Main Source] (file:///src/main.rs)"));
@@ -1263,7 +1311,10 @@ mod tests {
         };
         match translate_event(&evt) {
             EventTranslation::Update(acp::SessionUpdate::SessionInfoUpdate(u)) => {
-                assert_eq!(u.title.as_opt_ref().unwrap(), Some(&"Updated Title".to_string()));
+                assert_eq!(
+                    u.title.as_opt_ref().unwrap(),
+                    Some(&"Updated Title".to_string())
+                );
             }
             _ => panic!("Expected SessionInfoUpdate"),
         }
@@ -1348,7 +1399,10 @@ mod tests {
             EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
                 assert_eq!(tc.kind, acp::ToolKind::Read);
                 assert_eq!(tc.locations.len(), 1);
-                assert_eq!(tc.locations[0].path, std::path::PathBuf::from("/tmp/test.rs"));
+                assert_eq!(
+                    tc.locations[0].path,
+                    std::path::PathBuf::from("/tmp/test.rs")
+                );
                 assert_eq!(tc.locations[0].line, Some(10));
             }
             _ => panic!("Expected ToolCall"),
