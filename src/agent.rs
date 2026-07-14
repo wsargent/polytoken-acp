@@ -59,6 +59,11 @@ pub async fn run() {
                         "system_reminder": true,
                         "subagent_started": true,
                         "subagent_completed": true,
+                        "job_promoted": true,
+                        "job_completed": true,
+                        "job_expiring": true,
+                        "job_cancelled": true,
+                        "job_updated": true,
                     }),
                 );
                 let caps = acp::AgentCapabilities::new()
@@ -1457,6 +1462,29 @@ async fn process_sse_event(
             });
             send_ext_notification(conn, "_polytoken/subagent_completed", &params);
 
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::JobEvent {
+            job_id,
+            event_type,
+            subagent_handle: _,
+            exit_code,
+        } => {
+            // Shell job events (subagent jobs are filtered out in translate_job_event).
+            // Send extension notification with the event data.
+            let method = format!("_polytoken/{}", event_type);
+            let params = match exit_code {
+                Some(code) => serde_json::json!({
+                    "job_id": job_id,
+                    "exit_code": code,
+                    "subagent_handle": null,
+                }),
+                None => serde_json::json!({
+                    "job_id": job_id,
+                    "subagent_handle": null,
+                }),
+            };
+            send_ext_notification(conn, &method, &params);
             ConsumeOutcome::Continue
         }
         EventTranslation::Ignore => ConsumeOutcome::Continue,

@@ -113,6 +113,37 @@ pub enum DaemonEvent {
         #[serde(default)]
         result_summary: Option<String>,
     },
+    #[serde(rename = "job_promoted")]
+    JobPromoted {
+        job_id: String,
+        #[serde(default)]
+        subagent_handle: Option<String>,
+    },
+    #[serde(rename = "job_completed")]
+    JobCompleted {
+        job_id: String,
+        exit_code: i32,
+        #[serde(default)]
+        subagent_handle: Option<String>,
+    },
+    #[serde(rename = "job_expiring")]
+    JobExpiring {
+        job_id: String,
+        #[serde(default)]
+        subagent_handle: Option<String>,
+    },
+    #[serde(rename = "job_cancelled")]
+    JobCancelled {
+        job_id: String,
+        #[serde(default)]
+        subagent_handle: Option<String>,
+    },
+    #[serde(rename = "job_updated")]
+    JobUpdated {
+        job_id: String,
+        #[serde(default)]
+        subagent_handle: Option<String>,
+    },
     #[serde(rename = "heartbeat")]
     Heartbeat,
     #[serde(other)]
@@ -237,6 +268,16 @@ pub enum EventTranslation {
         handle: String,
         result_summary: Option<String>,
     },
+    /// A job lifecycle event — emit extension notification (and ToolCall for shell jobs).
+    /// Subagent jobs (subagent_handle is Some) are skipped to avoid duplicates with
+    /// the SubagentStarted/SubagentCompleted translations.
+    JobEvent {
+        job_id: String,
+        event_type: String,
+        #[allow(dead_code)]
+        subagent_handle: Option<String>,
+        exit_code: Option<i32>,
+    },
     /// Nothing to send (heartbeat, unknown, etc.)
     Ignore,
 }
@@ -260,6 +301,11 @@ pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
         DaemonEvent::FacetChanged { .. } => "facet_changed",
         DaemonEvent::SubagentStarted { .. } => "subagent_started",
         DaemonEvent::SubagentCompleted { .. } => "subagent_completed",
+        DaemonEvent::JobPromoted { .. } => "job_promoted",
+        DaemonEvent::JobCompleted { .. } => "job_completed",
+        DaemonEvent::JobExpiring { .. } => "job_expiring",
+        DaemonEvent::JobCancelled { .. } => "job_cancelled",
+        DaemonEvent::JobUpdated { .. } => "job_updated",
         DaemonEvent::Heartbeat => "heartbeat",
         DaemonEvent::Other => "unknown",
     }
@@ -399,6 +445,40 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
         } => {
             let summary = result_summary.as_deref().unwrap_or("(none)");
             format!("handle={} summary={}", handle, summary)
+        }
+        DaemonEvent::JobPromoted {
+            job_id,
+            subagent_handle,
+        } => {
+            format!("job_id={} subagent={:?}", job_id, subagent_handle)
+        }
+        DaemonEvent::JobCompleted {
+            job_id,
+            exit_code,
+            subagent_handle,
+        } => {
+            format!(
+                "job_id={} exit_code={} subagent={:?}",
+                job_id, exit_code, subagent_handle
+            )
+        }
+        DaemonEvent::JobExpiring {
+            job_id,
+            subagent_handle,
+        } => {
+            format!("job_id={} subagent={:?}", job_id, subagent_handle)
+        }
+        DaemonEvent::JobCancelled {
+            job_id,
+            subagent_handle,
+        } => {
+            format!("job_id={} subagent={:?}", job_id, subagent_handle)
+        }
+        DaemonEvent::JobUpdated {
+            job_id,
+            subagent_handle,
+        } => {
+            format!("job_id={} subagent={:?}", job_id, subagent_handle)
         }
         DaemonEvent::Heartbeat => String::new(),
         DaemonEvent::Other => String::new(),
@@ -652,7 +732,60 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             }
         }
 
+        // Job lifecycle events. All 5 types go through translate_job_event,
+        // which skips subagent jobs (already handled by SubagentStarted/Completed).
+        DaemonEvent::JobPromoted {
+            job_id,
+            subagent_handle,
+        } => translate_job_event(job_id, "job_promoted", subagent_handle, None),
+        DaemonEvent::JobCompleted {
+            job_id,
+            exit_code,
+            subagent_handle,
+        } => translate_job_event(job_id, "job_completed", subagent_handle, Some(*exit_code)),
+        DaemonEvent::JobExpiring {
+            job_id,
+            subagent_handle,
+        } => translate_job_event(job_id, "job_expiring", subagent_handle, None),
+        DaemonEvent::JobCancelled {
+            job_id,
+            subagent_handle,
+        } => translate_job_event(job_id, "job_cancelled", subagent_handle, None),
+        DaemonEvent::JobUpdated {
+            job_id,
+            subagent_handle,
+        } => translate_job_event(job_id, "job_updated", subagent_handle, None),
+
         _ => EventTranslation::Ignore,
+    }
+}
+
+/// Translate daemon job events. All 5 job event types map to a single
+/// `JobEvent` translation carrying the event type name, so the handler in
+/// agent.rs can decide what to do based on the event type.
+///
+/// Deduplication: when `subagent_handle` is `Some`, the subagent lifecycle
+/// events (SubagentStarted/SubagentCompleted) already emit ToolCalls and
+/// extension notifications. The job event for that same subagent is
+/// translated to `Ignore` to avoid duplicates.
+fn translate_job_event(
+    job_id: &str,
+    event_type: &str,
+    subagent_handle: &Option<String>,
+    exit_code: Option<i32>,
+) -> EventTranslation {
+    let _ = (job_id, event_type); // used by the caller for logging
+    if subagent_handle.is_some() {
+        // Subagent jobs are already handled by SubagentStarted/SubagentCompleted.
+        EventTranslation::Ignore
+    } else {
+        // Shell job — emit extension notification.
+        EventTranslation::JobEvent {
+            job_id: job_id.to_string(),
+            event_type: event_type.to_string(),
+            subagent_handle: subagent_handle.clone(),
+            exit_code,
+        }
     }
 }
 
@@ -1661,6 +1794,120 @@ mod tests {
                 assert_eq!(result_summary.as_deref(), Some("All done"));
             }
             _ => panic!("Expected SubagentCompleted translation"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_job_promoted() {
+        let json = r#"{"type":"job_promoted","job_id":"job_1","subagent_handle":null}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::JobPromoted {
+                job_id,
+                subagent_handle,
+            } => {
+                assert_eq!(job_id, "job_1");
+                assert!(subagent_handle.is_none());
+            }
+            _ => panic!("Expected JobPromoted"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_job_completed() {
+        let json =
+            r#"{"type":"job_completed","job_id":"job_1","exit_code":0,"subagent_handle":null}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::JobCompleted {
+                job_id,
+                exit_code,
+                subagent_handle,
+            } => {
+                assert_eq!(job_id, "job_1");
+                assert_eq!(exit_code, 0);
+                assert!(subagent_handle.is_none());
+            }
+            _ => panic!("Expected JobCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_job_cancelled() {
+        let json = r#"{"type":"job_cancelled","job_id":"job_2","subagent_handle":"sa_1"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::JobCancelled {
+                job_id,
+                subagent_handle,
+            } => {
+                assert_eq!(job_id, "job_2");
+                assert_eq!(subagent_handle.as_deref(), Some("sa_1"));
+            }
+            _ => panic!("Expected JobCancelled"),
+        }
+    }
+
+    #[test]
+    fn test_translate_job_event_shell() {
+        // Shell job (subagent_handle is None) → JobEvent
+        let evt = DaemonEvent::JobCompleted {
+            job_id: "job_1".into(),
+            exit_code: 0,
+            subagent_handle: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::JobEvent {
+                job_id,
+                event_type,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(job_id, "job_1");
+                assert_eq!(event_type, "job_completed");
+                assert_eq!(exit_code, Some(0));
+            }
+            _ => panic!("Expected JobEvent translation for shell job"),
+        }
+    }
+
+    #[test]
+    fn test_translate_job_event_subagent_skip() {
+        // Subagent job (subagent_handle is Some) → Ignore (dedup)
+        let evt = DaemonEvent::JobCompleted {
+            job_id: "job_1".into(),
+            exit_code: 0,
+            subagent_handle: Some("sa_1".into()),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Ignore => {}
+            _ => panic!("Expected Ignore for subagent job (dedup)"),
+        }
+    }
+
+    #[test]
+    fn test_translate_job_promoted_shell() {
+        let evt = DaemonEvent::JobPromoted {
+            job_id: "job_1".into(),
+            subagent_handle: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::JobEvent { event_type, .. } => {
+                assert_eq!(event_type, "job_promoted");
+            }
+            _ => panic!("Expected JobEvent"),
+        }
+    }
+
+    #[test]
+    fn test_translate_job_expiring_subagent_skip() {
+        let evt = DaemonEvent::JobExpiring {
+            job_id: "job_1".into(),
+            subagent_handle: Some("sa_1".into()),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Ignore => {}
+            _ => panic!("Expected Ignore for subagent job (dedup)"),
         }
     }
 }
