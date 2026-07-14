@@ -12,11 +12,18 @@ use tracing::info;
 
 fn main() {
     // Initialize tracing — output goes to stderr ONLY (stdout is JSON-RPC)
+    // Default filter: info-level for everything, with the conversation target
+    // at info for readable turn-by-turn conversation logs.
+    // Override with RUST_LOG, e.g.:
+    //   RUST_LOG=info                    — default conversation monitoring
+    //   RUST_LOG=debug                   — include raw daemon events and ACP notifications
+    //   RUST_LOG=polytoken_acp=debug    — shim logs only, debug level
+    //   RUST_LOG=polytoken_acp::conv=debug — verbose per-event conversation logging
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,polytoken_acp::conv=info")),
         )
         .init();
 

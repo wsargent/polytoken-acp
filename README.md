@@ -116,8 +116,31 @@ cargo test -- --ignored
 The shim logs to stderr (stdout is reserved for JSON-RPC). Set the `RUST_LOG` environment variable:
 
 ```bash
+# Default: conversation-level logging (prompts, tool calls, permissions, turn events)
+RUST_LOG=info polytoken-acp
+
+# Include per-event detail: every daemon SSE event and ACP notification
 RUST_LOG=debug polytoken-acp
+
+# Shim logs only (suppress daemon stderr)
+RUST_LOG=polytoken_acp=info polytoken-acp
+
+# Verbose conversation logging only
+RUST_LOG=polytoken_acp::conv=debug polytoken-acp
 ```
+
+The conversation log target (`polytoken_acp::conv`) provides a readable, turn-by-turn view of the interaction:
+
+- **`─── PROMPT START ───`** — when a user prompt is forwarded to the daemon (with preview)
+- **`daemon → acp`** — every daemon SSE event translated to an ACP notification (event type + summary)
+- **`acp → client`** — each ACP session update sent to the editor
+- **`─── TURN END ───` / `─── TURN CANCELLED ───`** — when the assistant turn completes
+- **`─── PERMISSION REQUEST ───` / `─── PERMISSION RESPONSE ───`** — permission interrogatives
+- **`─── INTERROGATIVE REQUEST ───` / `─── INTERROGATIVE RESPONSE ───`** — non-permission interrogatives
+- **`─── ASK USER QUESTION ───`** — `ask_user_question` events
+- **`─── CANCEL ───`** — when the client cancels a turn
+
+At `debug` level, the `daemon → acp` lines show the event type, key fields, and content previews (up to 80–120 chars) so you can follow the conversation without seeing full payloads.
 
 ### Daemon process issues
 

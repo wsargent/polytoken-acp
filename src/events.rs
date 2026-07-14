@@ -218,6 +218,131 @@ pub enum EventTranslation {
     Ignore,
 }
 
+/// Human-readable type name for a daemon event (for logging).
+pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
+    match evt {
+        DaemonEvent::MessageStart { .. } => "message_start",
+        DaemonEvent::ContentBlockStart { .. } => "content_block_start",
+        DaemonEvent::ContentBlockDelta { .. } => "content_block_delta",
+        DaemonEvent::ContentBlockStop { .. } => "content_block_stop",
+        DaemonEvent::MessageComplete { .. } => "message_complete",
+        DaemonEvent::TurnCancelled { .. } => "turn_cancelled",
+        DaemonEvent::ModelError { .. } => "model_error",
+        DaemonEvent::ToolCall { .. } => "tool_call",
+        DaemonEvent::ToolResult { .. } => "tool_result",
+        DaemonEvent::Interrogative { .. } => "interrogative",
+        DaemonEvent::AskUserQuestion { .. } => "ask_user_question",
+        DaemonEvent::ModelChanged { .. } => "model_changed",
+        DaemonEvent::SessionTitleChanged { .. } => "session_title_changed",
+        DaemonEvent::FacetChanged { .. } => "facet_changed",
+        DaemonEvent::Heartbeat => "heartbeat",
+        DaemonEvent::Other => "unknown",
+    }
+}
+
+/// Human-readable summary of key fields for a daemon event (for logging).
+/// Returns a compact, single-line description suitable for log fields.
+pub fn event_summary(evt: &DaemonEvent) -> String {
+    match evt {
+        DaemonEvent::MessageStart { prompt_id } => format!("prompt_id={}", prompt_id),
+        DaemonEvent::ContentBlockStart { prompt_id, block_index, .. } => {
+            format!("prompt_id={} block_index={}", prompt_id, block_index)
+        }
+        DaemonEvent::ContentBlockDelta { prompt_id, block_index, delta } => {
+            let delta_desc = match delta {
+                BlockDeltaPayload::TextDelta { text } => {
+                    let preview: String = text.chars().take(80).collect();
+                    format!("text_delta len={} preview={:?}", text.len(), preview)
+                }
+                BlockDeltaPayload::ToolUseInput { partial_json } => {
+                    format!("tool_use_input len={}", partial_json.len())
+                }
+                BlockDeltaPayload::Thinking { text } => {
+                    let preview: String = text.chars().take(80).collect();
+                    format!("thinking len={} preview={:?}", text.len(), preview)
+                }
+                BlockDeltaPayload::SignatureDelta { .. } => "signature_delta".to_string(),
+                BlockDeltaPayload::RedactedThinking { data } => {
+                    format!("redacted_thinking len={}", data.len())
+                }
+                BlockDeltaPayload::OpenAiReasoning { id, data } => {
+                    format!("openai_reasoning id={} len={}", id, data.len())
+                }
+                BlockDeltaPayload::Other => "other_delta".to_string(),
+            };
+            format!("prompt_id={} block_index={} {}", prompt_id, block_index, delta_desc)
+        }
+        DaemonEvent::ContentBlockStop { prompt_id, block_index } => {
+            format!("prompt_id={} block_index={}", prompt_id, block_index)
+        }
+        DaemonEvent::MessageComplete { prompt_id } => format!("prompt_id={}", prompt_id),
+        DaemonEvent::TurnCancelled { prompt_id } => format!("prompt_id={}", prompt_id),
+        DaemonEvent::ModelError { prompt_id } => format!("prompt_id={}", prompt_id),
+        DaemonEvent::ToolCall { prompt_id, call_id, name, input, .. } => {
+            let input_desc = match input {
+                Some(v) => {
+                    let s = serde_json::to_string(v).unwrap_or_default();
+                    let preview: String = s.chars().take(120).collect();
+                    format!(" input={}", preview)
+                }
+                None => String::new(),
+            };
+            format!("prompt_id={} call_id={} name={}{}", prompt_id, call_id, name, input_desc)
+        }
+        DaemonEvent::ToolResult { prompt_id, call_id, content, content_full, is_error, .. } => {
+            let content_desc = if let Some(c) = content_full.as_ref().or(content.as_ref()) {
+                let preview: String = c.chars().take(120).collect();
+                format!(" content={}", preview)
+            } else {
+                String::new()
+            };
+            format!(
+                "prompt_id={} call_id={} is_error={}{}",
+                prompt_id,
+                call_id,
+                is_error.unwrap_or(false),
+                content_desc
+            )
+        }
+        DaemonEvent::Interrogative { prompt_id, interrogative_id, question, interrogative_type, .. } => {
+            let preview: String = question.chars().take(100).collect();
+            format!(
+                "prompt_id={} id={} type={} question={:?}",
+                prompt_id, interrogative_id, interrogative_type, preview
+            )
+        }
+        DaemonEvent::AskUserQuestion { prompt_id, interrogative_id, payload, .. } => {
+            format!(
+                "prompt_id={} id={} questions={}",
+                prompt_id, interrogative_id, payload.questions.len()
+            )
+        }
+        DaemonEvent::ModelChanged { model } => format!("model={}", model),
+        DaemonEvent::SessionTitleChanged { title } => format!("title={}", title),
+        DaemonEvent::FacetChanged { facet } => format!("facet={}", facet),
+        DaemonEvent::Heartbeat => String::new(),
+        DaemonEvent::Other => String::new(),
+    }
+}
+
+/// Human-readable name for an ACP SessionUpdate variant (for logging).
+pub fn session_update_name(update: &acp::SessionUpdate) -> &'static str {
+    match update {
+        acp::SessionUpdate::UserMessageChunk(_) => "user_message_chunk",
+        acp::SessionUpdate::AgentMessageChunk(_) => "agent_message_chunk",
+        acp::SessionUpdate::AgentThoughtChunk(_) => "agent_thought_chunk",
+        acp::SessionUpdate::ToolCall(_) => "tool_call",
+        acp::SessionUpdate::ToolCallUpdate(_) => "tool_call_update",
+        acp::SessionUpdate::Plan(_) => "plan",
+        acp::SessionUpdate::AvailableCommandsUpdate(_) => "available_commands_update",
+        acp::SessionUpdate::CurrentModeUpdate(_) => "current_mode_update",
+        acp::SessionUpdate::ConfigOptionUpdate(_) => "config_option_update",
+        acp::SessionUpdate::SessionInfoUpdate(_) => "session_info_update",
+        acp::SessionUpdate::UsageUpdate(_) => "usage_update",
+        _ => "other",
+    }
+}
+
 /// Extract the prompt_id from a daemon event (if present).
 pub fn event_prompt_id(evt: &DaemonEvent) -> Option<&str> {
     match evt {
