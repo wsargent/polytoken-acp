@@ -1274,7 +1274,7 @@ async fn handle_ask_user_question(
     };
 
     let ext_request = acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(
-        "polytoken/ask_user_question",
+        "_polytoken/ask_user_question",
         params,
     ));
 
