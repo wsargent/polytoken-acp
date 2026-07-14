@@ -655,3 +655,144 @@ async fn test_session_close() {
 
     client.kill().await;
 }
+
+/// session/new should include a permissions config option with the 4
+/// permission monitor modes.
+///
+/// Flow: initialize → authenticate → session/new
+/// Verifies:
+/// - configOptions contains an option with id=permissions, type=select
+/// - The select has 4 options: standard, bypass, bypass_plus, autonomous
+/// - The currentValue matches one of the 4 modes
+///
+/// Run with: cargo test --test smoke -- --ignored test_permissions_config_option
+#[tokio::test]
+#[ignore = "Requires polytoken binary + LLM credentials"]
+async fn test_permissions_config_option() {
+    if !polytoken_available() {
+        eprintln!("SKIP: polytoken binary not on PATH");
+        return;
+    }
+
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
+    let cwd = std::env::current_dir().unwrap();
+
+    // Initialize + authenticate
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
+        .await;
+    client
+        .request("authenticate", json!({"methodId": "noop"}))
+        .await;
+
+    // session/new
+    let result = client
+        .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await;
+
+    let config_options = result["configOptions"]
+        .as_array()
+        .expect("missing or non-array configOptions");
+
+    let permissions_option = config_options
+        .iter()
+        .find(|o| o["id"] == "permissions")
+        .expect("configOptions should contain an option with id=permissions");
+
+    assert_eq!(
+        permissions_option["type"], "select",
+        "permissions config option should be type=select"
+    );
+
+    let options = permissions_option["options"]
+        .as_array()
+        .expect("permissions options should be an array");
+    assert_eq!(
+        options.len(),
+        4,
+        "permissions select should have exactly 4 options"
+    );
+
+    let values: Vec<&str> = options
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert!(values.contains(&"standard"), "missing standard mode");
+    assert!(values.contains(&"bypass"), "missing bypass mode");
+    assert!(values.contains(&"bypass_plus"), "missing bypass_plus mode");
+    assert!(values.contains(&"autonomous"), "missing autonomous mode");
+
+    let current = permissions_option["currentValue"]
+        .as_str()
+        .expect("permissions option should have a currentValue");
+    assert!(
+        values.contains(&current),
+        "currentValue '{}' should be one of the 4 modes",
+        current
+    );
+
+    eprintln!("Permissions config option verified: current={current}");
+
+    client.kill().await;
+}
+
+/// session/set_config_option with permissions should switch permission mode.
+///
+/// Flow: initialize → authenticate → session/new → set_config_option(permissions, "bypass")
+///
+/// Run with: cargo test --test smoke -- --ignored test_set_permissions_config_option
+#[tokio::test]
+#[ignore = "Requires polytoken binary + LLM credentials"]
+async fn test_set_permissions_config_option() {
+    if !polytoken_available() {
+        eprintln!("SKIP: polytoken binary not on PATH");
+        return;
+    }
+
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
+    let cwd = std::env::current_dir().unwrap();
+
+    // Initialize + authenticate
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
+        .await;
+    client
+        .request("authenticate", json!({"methodId": "noop"}))
+        .await;
+
+    // Create a session
+    let result = client
+        .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await;
+    let session_id = result["sessionId"]
+        .as_str()
+        .expect("missing sessionId")
+        .to_string();
+
+    // Set permissions to bypass
+    let _result = client
+        .request(
+            "session/set_config_option",
+            json!({
+                "sessionId": &session_id,
+                "configId": "permissions",
+                "value": "bypass",
+            }),
+        )
+        .await;
+
+    // If we get here without panic, the config option was accepted.
+    eprintln!("session/set_config_option accepted permissions=bypass");
+
+    client.kill().await;
+}

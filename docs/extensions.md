@@ -146,12 +146,50 @@ const POLYTOKEN_REMINDER_METHOD = "_polytoken/system_reminder";
 
 This is a product decision for the Paseo side.
 
+## Session Config Options
+
+In addition to extension methods, `polytoken-acp` exposes daemon settings as standard ACP `SessionConfigOption` entries in the `session/new` and `session/resume` responses. These are not extension methods — they use the ACP session configuration protocol directly.
+
+### `permissions` (select)
+
+Exposes the daemon's permission monitor mode. The daemon stores this in `GET /permission-monitor` (not `/state`); `polytoken-acp` fetches it at session start and on `permission_monitor_switch` SSE events.
+
+| Option value | Label | Description |
+|---|---|---|
+| `standard` | Standard | Default permission prompts |
+| `bypass` | Bypass | Skip permission prompts |
+| `bypass_plus` | Bypass+ | Enhanced bypass mode |
+| `autonomous` | Autonomous | Autonomous classifier-based permissions |
+
+- **Config ID:** `permissions`
+- **Category:** `permissions` (custom — not one of ACP's built-in categories)
+- **Routing:** `set_session_config_option(permissions, "bypass")` → `POST /permission-monitor` with `{"mode": "bypass"}`
+- **Live updates:** When the daemon emits `permission_monitor_switch` (e.g. from `/permissions` in the TUI), `polytoken-acp` re-fetches `/state` + `/permission-monitor` and sends a `ConfigOptionUpdate` notification with the full option set.
+
+### Paseo rendering
+
+ACP config options with built-in categories (`mode`, `model`, `thought_level`) are rendered automatically by Paseo. The `permissions` category is custom, so Paseo needs a `configFeatureOption` registered for the polytoken provider to render it:
+
+```typescript
+// packages/server/src/server/agent/providers/polytoken-acp-agent.ts
+const POLYTOKEN_PERMISSIONS_FEATURE_OPTION: ACPConfigFeatureOption = {
+  id: "permissions",
+  configId: "permissions",
+  category: "permissions",
+  label: "Permissions",
+  description: "How tool call permissions are handled",
+};
+```
+
+Until that Paseo-side change is made, the `permissions` config option is sent over the wire but not rendered in Paseo's UI. See the [Paseo custom providers docs](https://paseo.sh/docs/custom-providers) for how ACP agents are configured.
+
 ## Summary
 
 | Method | Type | Direction | Expects response? | Status |
 |--------|------|-----------|-------------------|--------|
 | `_polytoken/ask_user_question` | ext request | daemon → client → daemon | Yes (answers array) | ✅ On main |
 | `_polytoken/system_reminder` | ext notification | daemon → client | No | 🔀 PR #17 |
+| `permissions` config option | SessionConfigOption | bidirectional | No (standard ACP) | 🔀 In progress |
 
 ## References
 

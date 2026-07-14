@@ -174,6 +174,11 @@ pub enum DaemonEvent {
     },
     #[serde(rename = "heartbeat")]
     Heartbeat,
+    #[serde(rename = "permission_monitor_switch")]
+    PermissionMonitorSwitch {
+        to_monitor: PermissionMonitorSummary,
+        from_monitor: PermissionMonitorSummary,
+    },
     #[serde(other)]
     Other,
 }
@@ -198,6 +203,16 @@ pub enum BlockDeltaPayload {
     OpenAiReasoning { id: String, data: String },
     #[serde(other)]
     Other,
+}
+
+/// Minimal extraction of the permission monitor `type` discriminator.
+/// The full PermissionMonitor tagged union has additional variant-specific
+/// fields (classifier_model, classifier_rules, max_consecutive_denials for
+/// autonomous), but we only need the mode string for config option updates.
+#[derive(Deserialize, Debug, Clone)]
+pub struct PermissionMonitorSummary {
+    #[serde(rename = "type")]
+    pub kind: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +332,8 @@ pub enum EventTranslation {
     GoalDriverUpdate { transition: String, summary: String },
     /// Re-fetch /state for todo/plan updates.
     TodoStateChange,
+    /// Permission monitor mode changed externally — re-fetch and send ConfigOptionUpdate.
+    PermissionMonitorSwitch { mode: String },
     /// Nothing to send (heartbeat, unknown, etc.)
     Ignore,
 }
@@ -351,6 +368,7 @@ pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
         DaemonEvent::SystemReminder { .. } => "system_reminder",
         DaemonEvent::UsageThrottle { .. } => "usage_throttle",
         DaemonEvent::Heartbeat => "heartbeat",
+        DaemonEvent::PermissionMonitorSwitch { .. } => "permission_monitor_switch",
         DaemonEvent::Other => "unknown",
     }
 }
@@ -546,6 +564,9 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
         }
         DaemonEvent::UsageThrottle { provider, .. } => format!("provider={}", provider),
         DaemonEvent::Heartbeat => String::new(),
+        DaemonEvent::PermissionMonitorSwitch { to_monitor, .. } => {
+            format!("mode={}", to_monitor.kind)
+        }
         DaemonEvent::Other => String::new(),
     }
 }
@@ -880,6 +901,14 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
         DaemonEvent::UsageThrottle { provider, .. } => {
             debug!(provider = %provider, "Usage throttle (logged, not forwarded)");
             EventTranslation::Ignore
+        }
+
+        // Permission monitor switched → re-fetch and send ConfigOptionUpdate
+        DaemonEvent::PermissionMonitorSwitch { to_monitor, .. } => {
+            debug!(mode = %to_monitor.kind, "Permission monitor switched");
+            EventTranslation::PermissionMonitorSwitch {
+                mode: to_monitor.kind.clone(),
+            }
         }
 
         _ => EventTranslation::Ignore,
@@ -2229,6 +2258,61 @@ mod tests {
         match translate_event(&evt) {
             EventTranslation::Ignore => {}
             _ => panic!("Expected Ignore for non-todos domain"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_permission_monitor_switch() {
+        let json = r#"{
+            "type": "permission_monitor_switch",
+            "from_monitor": {"type": "standard"},
+            "to_monitor": {"type": "bypass"}
+        }"#;
+        let evt: DaemonEvent = serde_json::from_str(json).expect("Failed to deserialize");
+        match evt {
+            DaemonEvent::PermissionMonitorSwitch {
+                to_monitor,
+                from_monitor,
+            } => {
+                assert_eq!(to_monitor.kind, "bypass");
+                assert_eq!(from_monitor.kind, "standard");
+            }
+            _ => panic!("Expected PermissionMonitorSwitch"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_permission_monitor_switch_autonomous() {
+        // The autonomous variant has extra fields that should be ignored.
+        let json = r#"{
+            "type": "permission_monitor_switch",
+            "from_monitor": {"type": "standard"},
+            "to_monitor": {"type": "autonomous", "classifier_model": null, "classifier_rules": null, "max_consecutive_denials": 3}
+        }"#;
+        let evt: DaemonEvent = serde_json::from_str(json).expect("Failed to deserialize");
+        match evt {
+            DaemonEvent::PermissionMonitorSwitch { to_monitor, .. } => {
+                assert_eq!(to_monitor.kind, "autonomous");
+            }
+            _ => panic!("Expected PermissionMonitorSwitch"),
+        }
+    }
+
+    #[test]
+    fn test_translate_permission_monitor_switch() {
+        let evt = DaemonEvent::PermissionMonitorSwitch {
+            to_monitor: PermissionMonitorSummary {
+                kind: "autonomous".into(),
+            },
+            from_monitor: PermissionMonitorSummary {
+                kind: "standard".into(),
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::PermissionMonitorSwitch { mode } => {
+                assert_eq!(mode, "autonomous");
+            }
+            _ => panic!("Expected PermissionMonitorSwitch translation"),
         }
     }
 }
