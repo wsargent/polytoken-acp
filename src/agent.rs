@@ -246,17 +246,22 @@ async fn handle_new_session(
                 }
             }
 
-            // Send available_commands_update with the daemon's slash commands.
-            if let Some(commands) = build_available_commands() {
-                let sid = acp::SessionId::new(session_id.clone());
-                let notification = acp::SessionNotification::new(
-                    sid,
-                    acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
-                        commands,
-                    )),
-                );
-                if let Err(e) = cx.send_notification(notification) {
-                    warn!(error = %e, "Failed to send available_commands_update notification");
+            // Send available_commands_update with the daemon's slash commands and skills.
+            {
+                let mut all_commands = build_available_commands().unwrap_or_default();
+                let skill_commands = build_skill_commands(&daemon_state);
+                all_commands.extend(skill_commands);
+                if !all_commands.is_empty() {
+                    let sid = acp::SessionId::new(session_id.clone());
+                    let notification = acp::SessionNotification::new(
+                        sid,
+                        acp::SessionUpdate::AvailableCommandsUpdate(
+                            acp::AvailableCommandsUpdate::new(all_commands),
+                        ),
+                    );
+                    if let Err(e) = cx.send_notification(notification) {
+                        warn!(error = %e, "Failed to send available_commands_update notification");
+                    }
                 }
             }
 
@@ -388,7 +393,7 @@ async fn handle_prompt(
     );
 
     // Collect connection info without holding lock across await
-    let (events_url, bearer_token, base_url) = {
+    let (events_url, bearer_token, base_url, cwd) = {
         let sessions = state.lock().unwrap();
         let daemon = match sessions.sessions.get(&session_id) {
             Some(d) => d,
@@ -405,8 +410,12 @@ async fn handle_prompt(
             daemon.events_url(),
             daemon.bearer_token().to_string(),
             daemon.base_url().to_string(),
+            daemon.cwd().to_path_buf(),
         )
     };
+
+    // Translate `/skillname` → `@skill:skillname` for known skills.
+    let prompt_text = translate_skill_invocations(&prompt_text, &cwd);
 
     // Send prompt to daemon
     let prompt_id = match DaemonHandle::prompt_with(&base_url, &bearer_token, &prompt_text).await {
@@ -609,6 +618,75 @@ fn build_available_commands() -> Option<Vec<acp::AvailableCommand>> {
         None
     } else {
         Some(acp_commands)
+    }
+}
+
+/// Build ACP available commands from the daemon's `available_skills` list in `/state`.
+///
+/// Each skill is advertised as an `AvailableCommand` with `_meta.polytoken.kind = "skill"`
+/// so clients can distinguish skills from regular slash commands. Skills are invoked
+/// via `@skill:<name>` in prompt text, but we advertise them with just the name so
+/// the shim can translate `/name` → `@skill:name` when forwarding the prompt.
+fn build_skill_commands(
+    state: &Result<serde_json::Value, anyhow::Error>,
+) -> Vec<acp::AvailableCommand> {
+    let state = match state {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to fetch daemon state for skills; skipping");
+            return Vec::new();
+        }
+    };
+
+    let skills = match state.get("available_skills").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "polytoken".to_string(),
+        serde_json::json!({"kind": "skill"}),
+    );
+
+    skills
+        .iter()
+        .filter_map(|s| s.as_str())
+        .map(|name| {
+            acp::AvailableCommand::new(name, format!("Invoke the '{}' skill", name))
+                .meta(meta.clone())
+        })
+        .collect()
+}
+
+/// Rewrite `/skillname` → `@skill:skillname` in prompt text when `skillname`
+/// is a known skill. Regular slash commands (e.g. `/clear`) pass through unchanged.
+///
+/// Checks the filesystem in the daemon's working directory for skill directories:
+/// `<cwd>/.polytoken/skills/<name>/SKILL.md` or `<cwd>/.agents/skills/<name>/SKILL.md`.
+fn translate_skill_invocations(prompt: &str, cwd: &std::path::Path) -> String {
+    // Only rewrite if the prompt starts with `/word` — skip regular text and
+    // known slash commands.
+    let trimmed = prompt.trim_start();
+    if !trimmed.starts_with('/') {
+        return prompt.to_string();
+    }
+    let rest = &trimmed[1..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    let candidate = &rest[..end];
+
+    // Check if this is a skill by looking for SKILL.md in the expected directories.
+    let is_skill = [".polytoken/skills", ".agents/skills"]
+        .iter()
+        .any(|dir| cwd.join(dir).join(candidate).join("SKILL.md").exists());
+
+    if is_skill {
+        let slash_pos = prompt.find('/').unwrap();
+        let prefix = &prompt[..slash_pos];
+        let suffix = &prompt[slash_pos + 1 + candidate.len()..];
+        format!("{}@skill:{}{}", prefix, candidate, suffix)
+    } else {
+        prompt.to_string()
     }
 }
 
@@ -1841,5 +1919,73 @@ mod tests {
         });
         let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
         assert!(build_thought_level_config_option(&state_result).is_none());
+    }
+
+    #[test]
+    fn test_build_skill_commands() {
+        let state = serde_json::json!({
+            "available_skills": ["triage", "release", "debug"]
+        });
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        let commands = build_skill_commands(&state_result);
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].name, "triage");
+        assert_eq!(commands[1].name, "release");
+        assert_eq!(commands[2].name, "debug");
+        // Each should have _meta with polytoken.kind = skill
+        let meta = commands[0].meta.as_ref().expect("missing _meta");
+        assert_eq!(meta["polytoken"]["kind"], "skill");
+    }
+
+    #[test]
+    fn test_build_skill_commands_empty() {
+        let state = serde_json::json!({});
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        let commands = build_skill_commands(&state_result);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_translate_skill_invocations_no_skill() {
+        // Regular slash commands pass through unchanged
+        let cwd = std::path::Path::new("/tmp");
+        assert_eq!(translate_skill_invocations("/clear", cwd), "/clear");
+        assert_eq!(
+            translate_skill_invocations("/compact some text", cwd),
+            "/compact some text"
+        );
+    }
+
+    #[test]
+    fn test_translate_skill_invocations_non_command() {
+        let cwd = std::path::Path::new("/tmp");
+        // Regular text passes through
+        assert_eq!(
+            translate_skill_invocations("hello world", cwd),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn test_translate_skill_invocations_real_skill() {
+        // Create a temp dir with a skill
+        let tmp = std::env::temp_dir().join("polytoken-acp-test-skill");
+        let skill_dir = tmp.join(".polytoken/skills/triage");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Triage\n").unwrap();
+
+        assert_eq!(
+            translate_skill_invocations("/triage", &tmp),
+            "@skill:triage"
+        );
+        assert_eq!(
+            translate_skill_invocations("/triage some context", &tmp),
+            "@skill:triage some context"
+        );
+        // Non-skill command in same dir passes through
+        assert_eq!(translate_skill_invocations("/clear", &tmp), "/clear");
+
+        // Cleanup
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
