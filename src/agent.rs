@@ -554,6 +554,9 @@ fn build_config_options(
         options.push(opt);
     }
 
+    // MCP server config options (one boolean toggle per server)
+    options.extend(build_mcp_config_options(state));
+
     options
 }
 
@@ -831,6 +834,52 @@ fn build_thought_level_config_option(
     )
 }
 
+/// Build MCP server config options from the daemon's `/state` response.
+///
+/// Each configured MCP server becomes a boolean `SessionConfigOption` with
+/// id `mcp:<server_name>`. The user can toggle enable/disable in Paseo's
+/// config UI, and we route the toggle to `POST /mcp/{name}/enable` or
+/// `POST /mcp/{name}/disable`.
+fn build_mcp_config_options(
+    state: &Result<serde_json::Value, anyhow::Error>,
+) -> Vec<acp::SessionConfigOption> {
+    let state = match state {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let servers = match state.get("mcp_servers").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    servers
+        .iter()
+        .filter_map(|s| {
+            let name = s.get("server_name")?.as_str()?;
+            let status = s.get("status")?.as_str()?;
+            let tool_count = s.get("tool_count").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            let enabled = status != "disabled";
+            let description = if tool_count > 0 {
+                format!("{} tools", tool_count)
+            } else {
+                "no tools".to_string()
+            };
+
+            Some(
+                acp::SessionConfigOption::boolean(
+                    format!("mcp:{}", name),
+                    name.to_string(),
+                    enabled,
+                )
+                .description(description)
+                .category(acp::SessionConfigOptionCategory::Other("mcp".into())),
+            )
+        })
+        .collect()
+}
+
 async fn handle_list_sessions(
     state: &Arc<Mutex<AgentState>>,
     _req: acp::ListSessionsRequest,
@@ -919,7 +968,11 @@ async fn handle_set_session_config_option(
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
     let config_id = req.config_id.0.to_string();
-    let value = req.value.as_value_id().map(|v| v.0.as_ref().to_string());
+    let value = req
+        .value
+        .as_value_id()
+        .map(|v| v.0.as_ref().to_string())
+        .or_else(|| req.value.as_bool().map(|b| b.to_string()));
 
     info!(
         session_id = %session_id,
@@ -947,7 +1000,7 @@ async fn handle_set_session_config_option(
     };
 
     // Route to the appropriate daemon endpoint based on config_id.
-    let (endpoint, payload, label) = match config_id.as_str() {
+    let (endpoint, payload, label): (String, serde_json::Value, &str) = match config_id.as_str() {
         "model" => (
             format!("{}/model", base_url),
             serde_json::json!({ "model": value }),
@@ -958,6 +1011,15 @@ async fn handle_set_session_config_option(
             serde_json::json!({ "facet": value }),
             "facet/mode",
         ),
+        mcp_id if mcp_id.starts_with("mcp:") => {
+            let server_name = &mcp_id[4..];
+            let action = if value == "true" { "enable" } else { "disable" };
+            (
+                format!("{}/mcp/{}/{}", base_url, server_name, action),
+                serde_json::json!({}),
+                "mcp",
+            )
+        }
         "thought_level" => {
             // Translate thought_level to a model switch.
             // The daemon encodes effort in model names: zai/glm-5.2(high)
@@ -2017,6 +2079,40 @@ mod tests {
         let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
         let commands = build_skill_commands(&state_result);
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_build_mcp_config_options() {
+        let state = serde_json::json!({
+            "mcp_servers": [
+                {"server_name": "filesystem", "status": "connected", "tool_count": 5},
+                {"server_name": "web-reader", "status": "disabled", "tool_count": 0},
+                {"server_name": "github", "status": "disconnected", "tool_count": 3},
+            ]
+        });
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        let options = build_mcp_config_options(&state_result);
+        assert_eq!(options.len(), 3);
+
+        // Connected server → enabled=true
+        assert_eq!(options[0].id.0.as_ref(), "mcp:filesystem");
+        assert!(matches!(&options[0].kind, acp::SessionConfigKind::Boolean(b) if b.current_value));
+
+        // Disabled server → enabled=false
+        assert_eq!(options[1].id.0.as_ref(), "mcp:web-reader");
+        assert!(matches!(&options[1].kind, acp::SessionConfigKind::Boolean(b) if !b.current_value));
+
+        // Disconnected server → still enabled=true (not disabled)
+        assert_eq!(options[2].id.0.as_ref(), "mcp:github");
+        assert!(matches!(&options[2].kind, acp::SessionConfigKind::Boolean(b) if b.current_value));
+    }
+
+    #[test]
+    fn test_build_mcp_config_options_empty() {
+        let state = serde_json::json!({});
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        let options = build_mcp_config_options(&state_result);
+        assert!(options.is_empty());
     }
 
     #[test]
