@@ -375,7 +375,7 @@ async fn handle_prompt(
         session_id = %session_id,
         prompt_len = prompt_text.len(),
         prompt_preview = %prompt_text.chars().take(200).collect::<String>(),
-        "─── PROMPT START ───"
+        "prompt_start"
     );
 
     // Collect connection info without holding lock across await
@@ -440,7 +440,7 @@ async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotifi
     tracing::info!(
         target: "polytoken_acp::conv",
         session_id = %session_id,
-        "─── CANCEL ───"
+        "cancel"
     );
 
     // We need to take the daemon out briefly to call cancel (which is async).
@@ -1001,7 +1001,7 @@ async fn process_sse_event(
         target: "polytoken_acp::conv",
         event_type = event_type,
         summary = %summary,
-        "daemon → acp"
+        "daemon_event"
     );
 
     // Filter by prompt_id if the event has one
@@ -1017,7 +1017,7 @@ async fn process_sse_event(
             tracing::debug!(
                 target: "polytoken_acp::conv",
                 update_type = update_name,
-                "acp → client"
+                "acp_notification"
             );
             let sid = acp::SessionId::new(session_id.to_string());
             let notification = acp::SessionNotification::new(sid, update.clone());
@@ -1030,7 +1030,7 @@ async fn process_sse_event(
             tracing::info!(
                 target: "polytoken_acp::conv",
                 prompt_id = %prompt_id,
-                "─── TURN END (end_turn) ───"
+                "turn_end"
             );
             ConsumeOutcome::Done(acp::StopReason::EndTurn)
         }
@@ -1038,7 +1038,7 @@ async fn process_sse_event(
             tracing::info!(
                 target: "polytoken_acp::conv",
                 prompt_id = %prompt_id,
-                "─── TURN CANCELLED ───"
+                "turn_cancelled"
             );
             ConsumeOutcome::Done(acp::StopReason::Cancelled)
         }
@@ -1101,7 +1101,7 @@ async fn handle_permission(
         target: "polytoken_acp::conv",
         interrogative_id = %interrogative_id,
         question = %question,
-        "─── PERMISSION REQUEST ───"
+        "permission_request"
     );
 
     let options = events::build_permission_options();
@@ -1135,7 +1135,7 @@ async fn handle_permission(
             target: "polytoken_acp::conv",
             interrogative_id = %interrogative_id,
             granted,
-            "─── PERMISSION RESPONSE ───"
+            "permission_response"
         );
 
         if let Err(e) =
@@ -1176,7 +1176,7 @@ async fn handle_interrogative(
         interrogative_id = %interrogative_id,
         interrogative_type = %interrogative_type,
         question = %question,
-        "─── INTERROGATIVE REQUEST ───"
+        "interrogative_request"
     );
 
     let options = events::build_permission_options();
@@ -1217,7 +1217,7 @@ async fn handle_interrogative(
             interrogative_id = %interrogative_id,
             interrogative_type = %interrogative_type,
             granted,
-            "─── INTERROGATIVE RESPONSE ───"
+            "interrogative_response"
         );
 
         // Map the ACP permission outcome to the appropriate daemon response kind.
@@ -1251,7 +1251,7 @@ async fn handle_ask_user_question(
         target: "polytoken_acp::conv",
         interrogative_id = %interrogative_id,
         question_count = payload.questions.len(),
-        "─── ASK_USER QUESTION ───"
+        "ask_user_question"
     );
 
     let request_json = serde_json::json!({

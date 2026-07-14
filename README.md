@@ -113,7 +113,7 @@ cargo test -- --ignored
 
 ### Debug logging
 
-The shim logs to stderr (stdout is reserved for JSON-RPC). Set the `RUST_LOG` environment variable:
+The shim logs structured JSON to stderr (stdout is reserved for JSON-RPC). Set the `RUST_LOG` environment variable:
 
 ```bash
 # Default: conversation-level logging (prompts, tool calls, permissions, turn events)
@@ -129,18 +129,27 @@ RUST_LOG=polytoken_acp=info polytoken-acp
 RUST_LOG=polytoken_acp::conv=debug polytoken-acp
 ```
 
-The conversation log target (`polytoken_acp::conv`) provides a readable, turn-by-turn view of the interaction:
+Each log line is a JSON object with fields like `timestamp`, `level`, `target`, `fields`, and `message`. The conversation target (`polytoken_acp::conv`) emits structured events:
 
-- **`─── PROMPT START ───`** — when a user prompt is forwarded to the daemon (with preview)
-- **`daemon → acp`** — every daemon SSE event translated to an ACP notification (event type + summary)
-- **`acp → client`** — each ACP session update sent to the editor
-- **`─── TURN END ───` / `─── TURN CANCELLED ───`** — when the assistant turn completes
-- **`─── PERMISSION REQUEST ───` / `─── PERMISSION RESPONSE ───`** — permission interrogatives
-- **`─── INTERROGATIVE REQUEST ───` / `─── INTERROGATIVE RESPONSE ───`** — non-permission interrogatives
-- **`─── ASK USER QUESTION ───`** — `ask_user_question` events
-- **`─── CANCEL ───`** — when the client cancels a turn
+| `message` field | Description | Key structured fields |
+|---|---|---|
+| `prompt_start` | User prompt forwarded to daemon | `session_id`, `prompt_len`, `prompt_preview` |
+| `daemon_event` | Daemon SSE event received and translated | `event_type`, `summary` |
+| `acp_notification` | ACP session update sent to editor | `update_type` |
+| `turn_end` | Assistant turn completed | `prompt_id` |
+| `turn_cancelled` | Turn was cancelled | `prompt_id` |
+| `permission_request` | Permission interrogative forwarded to client | `interrogative_id`, `question` |
+| `permission_response` | Client's permission answer relayed to daemon | `interrogative_id`, `granted` |
+| `interrogative_request` | Non-permission interrogative forwarded | `interrogative_id`, `interrogative_type`, `question` |
+| `interrogative_response` | Client's interrogative answer relayed | `interrogative_id`, `interrogative_type`, `granted` |
+| `ask_user_question` | `ask_user_question` event forwarded via ext_method | `interrogative_id`, `question_count` |
+| `cancel` | Client cancelled the turn | `session_id` |
 
-At `debug` level, the `daemon → acp` lines show the event type, key fields, and content previews (up to 80–120 chars) so you can follow the conversation without seeing full payloads.
+At `debug` level, the `daemon_event` lines include an `event_type` (e.g. `tool_call`, `content_block_delta`) and a `summary` with key fields and content previews (up to 80–120 chars). Example:
+
+```json
+{"timestamp":"2025-01-01T12:00:00.123Z","level":"DEBUG","target":"polytoken_acp::conv","fields":{"event_type":"tool_call","summary":"prompt_id=abc call_id=call_1 name=read_file input={\"path\":\"/tmp/test\"}"},"message":"daemon_event"}
+```
 
 ### Daemon process issues
 
