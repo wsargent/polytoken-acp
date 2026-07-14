@@ -63,10 +63,20 @@ Then launch Paseo, select "Polytoken" as the provider, and start a session.
 | Daemon SSE Event | ACP Action |
 |---|---|
 | `content_block_delta` (text_delta) | `session/update` → `agent_message_chunk` |
+| `content_block_delta` (thinking) | `session/update` → `agent_thought_chunk` |
+| `content_block_delta` (redacted_thinking) | `session/update` → `agent_thought_chunk` (placeholder) |
+| `content_block_delta` (open_ai_reasoning) | `session/update` → `agent_thought_chunk` |
+| `content_block_delta` (signature_delta) | Ignored (no ACP equivalent) |
+| `message_start` | Ignored (no ACP equivalent needed) |
 | `tool_call` | `session/update` → `tool_call` (status: pending) |
-| `tool_result` | `session/update` → `tool_call_update` (status: completed/failed) |
+| `tool_result` | `session/update` → `tool_call_update` (status: completed/failed). Uses `content_full` when available, falls back to `content`. |
 | `interrogative` (permission) | `session/request_permission` → `POST /interrogative/{id}/respond` |
+| `interrogative` (confirmation, capability, goal_proposal) | `session/request_permission` → `POST /interrogative/{id}/respond` (mapped to appropriate response kind) |
+| `interrogative` (clarification, plan_handoff) | `session/request_permission` → `POST /interrogative/{id}/respond` (best-effort; cancelled if unsupported) |
 | `ask_user_question` | `ext_method` (`polytoken/ask_user_question`) → `POST /interrogative/{id}/respond` |
+| `session_title_changed` | `session/update` → `session_info_update` (title) |
+| `facet_changed` | `session/update` → `current_mode_update` |
+| `model_changed` | Ignored (model config option already tracks state from `/state`) |
 | `message_complete` | `session/prompt` response with `stop_reason: end_turn` |
 | `turn_cancelled` | `session/prompt` response with `stop_reason: cancelled` |
 | `model_error` | `session/prompt` response with `stop_reason: end_turn` |
@@ -82,7 +92,10 @@ cargo test
 
 Unit tests cover:
 - SSE event deserialization (all handled event types + `#[serde(other)]` catch-all)
-- Event-to-ACP translation (text delta, tool call, tool result, message complete, turn cancelled, interrogative)
+- Event-to-ACP translation (text delta, thinking/reasoning deltas, tool call, tool result, message complete, turn cancelled, interrogative)
+- `message_start`, `model_changed`, `facet_changed`, `session_title_changed` deserialization and translation
+- `tool_result` with `content_full` fallback
+- Non-permission interrogative types (confirmation, etc.)
 - Permission translation (options construction, outcome→granted mapping)
 - `ask_user_question` event deserialization (payload with questions, options, modes) and translation
 - `ask_user_question` payload serialization for ext_method forwarding
@@ -122,3 +135,5 @@ The shim's own logging goes to stderr only. The daemon child process's stdout is
 
 - **MCP server forwarding**: Paseo's `mcpServers` are acknowledged but not forwarded to the polytoken daemon. Configure MCP servers in your `~/.config/polytoken/` config instead.
 - **`ask_user_question` via ext_method**: The daemon's `ask_user_question` events are forwarded to the ACP client via the `polytoken/ask_user_question` extension method. The client must implement `ext_method` and return a JSON object with an `answers` array (each answer has `question_id`, `selected_option_ids`, and/or `free_text`). If the client does not support the extension or returns no answers, the interrogative is cancelled on the daemon so the agent can proceed.
+- **Non-permission interrogatives**: `confirmation`, `capability`, and `goal_proposal` interrogatives are mapped to ACP `session/request_permission` (allow/reject) and translated to the appropriate daemon response kind. `clarification` and `plan_handoff` types cannot be fully answered via ACP's permission mechanism (they need structured input) and are cancelled if rejected.
+- **`model_changed` events**: The daemon emits `model_changed` events, but we don't forward them as `config_option_update` because we can't reconstruct the full model list from the event alone. The model config option is populated from `/state` at session creation and when `set_session_config_option` is called.

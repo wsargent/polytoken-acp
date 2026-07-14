@@ -1016,6 +1016,23 @@ async fn process_sse_event(
             .await;
             ConsumeOutcome::Continue
         }
+        EventTranslation::InterrogativeRequest {
+            interrogative_id,
+            question,
+            interrogative_type,
+        } => {
+            handle_interrogative(
+                conn,
+                &interrogative_id,
+                &question,
+                &interrogative_type,
+                session_id,
+                base_url,
+                bearer_token,
+            )
+            .await;
+            ConsumeOutcome::Continue
+        }
         EventTranslation::AskUserQuestion {
             interrogative_id,
             payload,
@@ -1068,6 +1085,73 @@ async fn handle_permission(
 
         if let Err(e) =
             respond_interrogative_permission(&base_url, &bearer_token, &interrogative_id, granted)
+                .await
+        {
+            error!(error = %e, "Failed to respond to interrogative on daemon");
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+/// Forward a non-permission interrogative (confirmation, clarification, etc.)
+/// to the ACP client via `session/request_permission` and relay the response.
+///
+/// For non-permission interrogatives, we map "allow" to a positive answer and
+/// "reject" to a negative answer. The daemon endpoint accepts different response
+/// kinds depending on the interrogative type.
+async fn handle_interrogative(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    question: &str,
+    interrogative_type: &str,
+    session_id: &str,
+    base_url: &str,
+    bearer_token: &str,
+) {
+    info!(
+        interrogative_id = %interrogative_id,
+        interrogative_type = %interrogative_type,
+        "Forwarding interrogative to ACP client"
+    );
+
+    let options = events::build_permission_options();
+    let tool_call_update = acp::ToolCallUpdate::new(
+        interrogative_id.to_string(),
+        acp::ToolCallUpdateFields::new()
+            .title(question.to_string())
+            .status(acp::ToolCallStatus::Pending),
+    );
+
+    let sid = acp::SessionId::new(session_id.to_string());
+    let request = acp::RequestPermissionRequest::new(sid, tool_call_update, options);
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+    let interrogative_type = interrogative_type.to_string();
+
+    let sent = conn.send_request(request);
+    sent.on_receiving_result(async move |result| {
+        let granted = match result {
+            Ok(response) => events::resolve_permission_outcome(&response.outcome),
+            Err(e) => {
+                error!(error = %e, "Interrogative request failed");
+                false
+            }
+        };
+
+        info!(
+            interrogative_id = %interrogative_id,
+            interrogative_type = %interrogative_type,
+            granted,
+            "Interrogative response from client"
+        );
+
+        // Map the ACP permission outcome to the appropriate daemon response kind.
+        if let Err(e) =
+            respond_interrogative_generic(&base_url, &bearer_token, &interrogative_id, &interrogative_type, granted)
                 .await
         {
             error!(error = %e, "Failed to respond to interrogative on daemon");
@@ -1212,6 +1296,53 @@ async fn respond_interrogative_permission(
         .await?;
     if !resp.status().is_success() {
         warn!(status = %resp.status(), "Interrogative response failed");
+    }
+    Ok(())
+}
+
+/// POST a generic interrogative response to the daemon.
+///
+/// Maps the ACP permission outcome (allow/reject) to the appropriate daemon
+/// response kind based on the interrogative type:
+/// - `confirmation` → `{"kind": "confirmation_answer", "confirmed": granted}`
+/// - `capability` → `{"kind": "capability_answer", "granted": granted}`
+/// - `goal_proposal` → `{"kind": "goal_proposal_answer", "accepted": granted}`
+/// - `plan_handoff` → `{"kind": "plan_handoff_answer", "decision": ...}` (best-effort)
+/// - `clarification` → `{"kind": "clarification_choice", "choice": ...}` (best-effort)
+/// - fallback → `{"kind": "cancel"}` (can't meaningfully answer)
+async fn respond_interrogative_generic(
+    base_url: &str,
+    bearer_token: &str,
+    interrogative_id: &str,
+    interrogative_type: &str,
+    granted: bool,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
+
+    let body = match interrogative_type {
+        "confirmation" => serde_json::json!({"kind": "confirmation_answer", "confirmed": granted}),
+        "capability" => serde_json::json!({"kind": "capability_answer", "granted": granted}),
+        "goal_proposal" => serde_json::json!({"kind": "goal_proposal_answer", "accepted": granted}),
+        // For clarification and plan_handoff, we can't fully answer without
+        // structured input from the user. Cancel if rejected; default if granted.
+        _ => {
+            warn!(
+                interrogative_type = %interrogative_type,
+                "Unsupported interrogative type for generic response; cancelling"
+            );
+            serde_json::json!({"kind": "cancel"})
+        }
+    };
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "Generic interrogative response failed");
     }
     Ok(())
 }

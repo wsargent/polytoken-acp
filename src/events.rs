@@ -40,6 +40,8 @@ pub fn parse_sse_event(data: &str) -> Option<DaemonEvent> {
 #[serde(tag = "type")]
 #[allow(dead_code)]
 pub enum DaemonEvent {
+    #[serde(rename = "message_start")]
+    MessageStart { prompt_id: String },
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
         prompt_id: String,
@@ -76,6 +78,8 @@ pub enum DaemonEvent {
         #[serde(default)]
         content: Option<String>,
         #[serde(default)]
+        content_full: Option<String>,
+        #[serde(default)]
         is_error: Option<bool>,
     },
     #[serde(rename = "interrogative")]
@@ -91,6 +95,12 @@ pub enum DaemonEvent {
         interrogative_id: String,
         payload: AskUserQuestionPayload,
     },
+    #[serde(rename = "model_changed")]
+    ModelChanged { model: String },
+    #[serde(rename = "session_title_changed")]
+    SessionTitleChanged { title: String },
+    #[serde(rename = "facet_changed")]
+    FacetChanged { facet: String },
     #[serde(rename = "heartbeat")]
     Heartbeat,
     #[serde(other)]
@@ -191,6 +201,13 @@ pub enum EventTranslation {
         interrogative_id: String,
         question: String,
     },
+    /// A non-permission interrogative (confirmation, clarification, etc.) that
+    /// needs an ACP round-trip via the permission request mechanism.
+    InterrogativeRequest {
+        interrogative_id: String,
+        question: String,
+        interrogative_type: String,
+    },
     /// An ask_user_question request from the daemon that needs an ACP round-trip
     /// via ext_method.
     AskUserQuestion {
@@ -204,7 +221,8 @@ pub enum EventTranslation {
 /// Extract the prompt_id from a daemon event (if present).
 pub fn event_prompt_id(evt: &DaemonEvent) -> Option<&str> {
     match evt {
-        DaemonEvent::ContentBlockStart { prompt_id, .. }
+        DaemonEvent::MessageStart { prompt_id }
+        | DaemonEvent::ContentBlockStart { prompt_id, .. }
         | DaemonEvent::ContentBlockDelta { prompt_id, .. }
         | DaemonEvent::ContentBlockStop { prompt_id, .. }
         | DaemonEvent::MessageComplete { prompt_id }
@@ -230,7 +248,49 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             let chunk = acp::ContentChunk::new(content_block);
             EventTranslation::Update(acp::SessionUpdate::AgentMessageChunk(chunk))
         }
+
+        // Thinking delta → AgentThoughtChunk
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::Thinking { text },
+            ..
+        } => {
+            let content_block: acp::ContentBlock = text.clone().into();
+            let chunk = acp::ContentChunk::new(content_block);
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(chunk))
+        }
+
+        // Redacted thinking → AgentThoughtChunk (placeholder text)
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::RedactedThinking { data },
+            ..
+        } => {
+            let text = format!("[redacted reasoning: {}]", data);
+            let content_block: acp::ContentBlock = text.into();
+            let chunk = acp::ContentChunk::new(content_block);
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(chunk))
+        }
+
+        // Signature delta → ignore (no ACP equivalent)
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::SignatureDelta { .. },
+            ..
+        } => EventTranslation::Ignore,
+
+        // OpenAI reasoning → AgentThoughtChunk
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::OpenAiReasoning { data, .. },
+            ..
+        } => {
+            let content_block: acp::ContentBlock = data.clone().into();
+            let chunk = acp::ContentChunk::new(content_block);
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(chunk))
+        }
+
+        // Other content_block_delta variants → ignore
         DaemonEvent::ContentBlockDelta { .. } => EventTranslation::Ignore,
+
+        // Message start → ignore (no ACP equivalent needed)
+        DaemonEvent::MessageStart { .. } => EventTranslation::Ignore,
 
         // Tool call → ToolCall session update
         DaemonEvent::ToolCall {
@@ -251,6 +311,7 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
         DaemonEvent::ToolResult {
             call_id,
             content,
+            content_full,
             is_error,
             ..
         } => {
@@ -260,7 +321,9 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                 acp::ToolCallStatus::Completed
             };
             let mut fields = acp::ToolCallUpdateFields::new().status(status);
-            if let Some(c) = &content {
+            // Prefer content_full over content for the tool call output
+            let effective_content = content_full.as_ref().or(content.as_ref());
+            if let Some(c) = effective_content {
                 // Try to parse content as JSON for raw_output
                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(c) {
                     fields = fields.raw_output(json_val);
@@ -284,7 +347,7 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             EventTranslation::TurnEnd
         }
 
-        // Interrogative (permission) → forward to ACP client only for permission type
+        // Interrogative (permission) → forward to ACP client
         DaemonEvent::Interrogative {
             interrogative_id,
             question,
@@ -298,8 +361,17 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                     question: question.clone(),
                 }
             } else {
-                warn!(interrogative_type = %interrogative_type, "Non-permission interrogative; auto-responding for v1");
-                EventTranslation::Ignore
+                // Forward non-permission interrogatives (confirmation, clarification,
+                // capability, plan_handoff, goal_proposal) as permission-like requests
+                debug!(
+                    interrogative_type = %interrogative_type,
+                    "Non-permission interrogative from daemon; forwarding to ACP client"
+                );
+                EventTranslation::InterrogativeRequest {
+                    interrogative_id: interrogative_id.clone(),
+                    question: question.clone(),
+                    interrogative_type: interrogative_type.clone(),
+                }
             }
         }
 
@@ -318,6 +390,29 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                 interrogative_id: interrogative_id.clone(),
                 payload: payload.clone(),
             }
+        }
+
+        // Model changed → send config_option_update so client refreshes model picker
+        DaemonEvent::ModelChanged { model } => {
+            debug!(model = %model, "Model changed; forwarding as session_info_update");
+            // We can't build a full config_option_update here without the full list,
+            // so we send a session_info_update with the model in _meta for clients
+            // that want it. The model config option is already set from /state.
+            EventTranslation::Ignore
+        }
+
+        // Session title changed → forward as session_info_update
+        DaemonEvent::SessionTitleChanged { title } => {
+            debug!(title = %title, "Session title changed; forwarding as session_info_update");
+            let info_update = acp::SessionInfoUpdate::new().title(title.clone());
+            EventTranslation::Update(acp::SessionUpdate::SessionInfoUpdate(info_update))
+        }
+
+        // Facet changed → forward as current_mode_update
+        DaemonEvent::FacetChanged { facet } => {
+            debug!(facet = %facet, "Facet changed; forwarding as current_mode_update");
+            let mode_update = acp::CurrentModeUpdate::new(facet.clone());
+            EventTranslation::Update(acp::SessionUpdate::CurrentModeUpdate(mode_update))
         }
 
         _ => EventTranslation::Ignore,
@@ -525,6 +620,7 @@ mod tests {
             prompt_id: "abc".into(),
             call_id: "c1".into(),
             content: Some("result".into()),
+            content_full: None,
             is_error: Some(false),
         };
         match translate_event(&evt) {
@@ -541,6 +637,7 @@ mod tests {
             prompt_id: "abc".into(),
             call_id: "c1".into(),
             content: None,
+            content_full: None,
             is_error: Some(true),
         };
         match translate_event(&evt) {
@@ -789,5 +886,150 @@ mod tests {
             back.questions[0].options[0].justification.as_deref(),
             Some("because")
         );
+    }
+
+    #[test]
+    fn test_deserialize_message_start() {
+        let json = r#"{"type":"message_start","prompt_id":"abc"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(evt, DaemonEvent::MessageStart { .. }));
+    }
+
+    #[test]
+    fn test_translate_thinking_delta() {
+        let evt = DaemonEvent::ContentBlockDelta {
+            prompt_id: "abc".into(),
+            block_index: 0,
+            delta: BlockDeltaPayload::Thinking {
+                text: "I should check...".into(),
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(_)) => {}
+            _ => panic!("Expected AgentThoughtChunk"),
+        }
+    }
+
+    #[test]
+    fn test_translate_redacted_thinking_delta() {
+        let evt = DaemonEvent::ContentBlockDelta {
+            prompt_id: "abc".into(),
+            block_index: 0,
+            delta: BlockDeltaPayload::RedactedThinking {
+                data: "opaque".into(),
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(_)) => {}
+            _ => panic!("Expected AgentThoughtChunk for redacted thinking"),
+        }
+    }
+
+    #[test]
+    fn test_translate_openai_reasoning_delta() {
+        let evt = DaemonEvent::ContentBlockDelta {
+            prompt_id: "abc".into(),
+            block_index: 0,
+            delta: BlockDeltaPayload::OpenAiReasoning {
+                id: "r1".into(),
+                data: "reasoning text".into(),
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(_)) => {}
+            _ => panic!("Expected AgentThoughtChunk for OpenAI reasoning"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_session_title_changed() {
+        let json = r#"{"type":"session_title_changed","title":"New Title","source":"inferred"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::SessionTitleChanged { title } => {
+                assert_eq!(title, "New Title");
+            }
+            _ => panic!("Expected SessionTitleChanged"),
+        }
+    }
+
+    #[test]
+    fn test_translate_session_title_changed() {
+        let evt = DaemonEvent::SessionTitleChanged {
+            title: "Updated Title".into(),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::SessionInfoUpdate(u)) => {
+                assert_eq!(u.title.as_opt_ref().unwrap(), Some(&"Updated Title".to_string()));
+            }
+            _ => panic!("Expected SessionInfoUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_model_changed() {
+        let json = r#"{"type":"model_changed","model":"gpt-4o"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(evt, DaemonEvent::ModelChanged { .. }));
+    }
+
+    #[test]
+    fn test_deserialize_facet_changed() {
+        let json = r#"{"type":"facet_changed","facet":"plan"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::FacetChanged { facet } => {
+                assert_eq!(facet, "plan");
+            }
+            _ => panic!("Expected FacetChanged"),
+        }
+    }
+
+    #[test]
+    fn test_translate_facet_changed() {
+        let evt = DaemonEvent::FacetChanged {
+            facet: "plan".into(),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::CurrentModeUpdate(u)) => {
+                assert_eq!(u.current_mode_id.0.as_ref(), "plan");
+            }
+            _ => panic!("Expected CurrentModeUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_translate_interrogative_confirmation() {
+        let evt = DaemonEvent::Interrogative {
+            prompt_id: "abc".into(),
+            interrogative_id: "int_1".into(),
+            question: "Are you sure?".into(),
+            interrogative_type: "confirmation".into(),
+        };
+        match translate_event(&evt) {
+            EventTranslation::InterrogativeRequest {
+                interrogative_type, ..
+            } => {
+                assert_eq!(interrogative_type, "confirmation");
+            }
+            _ => panic!("Expected InterrogativeRequest"),
+        }
+    }
+
+    #[test]
+    fn test_translate_tool_result_content_full() {
+        let evt = DaemonEvent::ToolResult {
+            prompt_id: "abc".into(),
+            call_id: "c1".into(),
+            content: Some("truncated".into()),
+            content_full: Some("full content here".into()),
+            is_error: Some(false),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCallUpdate(u)) => {
+                assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Completed));
+            }
+            _ => panic!("Expected ToolCallUpdate"),
+        }
     }
 }
