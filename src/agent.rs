@@ -529,6 +529,11 @@ fn build_config_options(
         options.push(opt);
     }
 
+    // Thought level config option (category=thought_level)
+    if let Some(opt) = build_thought_level_config_option(state) {
+        options.push(opt);
+    }
+
     options
 }
 
@@ -648,6 +653,92 @@ fn build_model_config_option(
     Some(
         acp::SessionConfigOption::select("model", "Model", current_value, options)
             .category(acp::SessionConfigOptionCategory::Model),
+    )
+}
+
+/// Build the `thought_level` config option from the active model's reasoning
+/// capability.
+///
+/// The daemon's `/state` response includes:
+/// - `active_model`: the current model name (e.g. `zai/glm-5.2`)
+/// - `active_reasoning_effort`: the current effort level (e.g. `high`)
+/// - `available_models[]`: each has a `reasoning` field describing effort levels
+///
+/// We find the active model in `available_models`, extract its reasoning levels,
+/// and build a select config option. When Paseo sets a thought_level, we translate
+/// it to a model switch: `zai/glm-5.2(high)` instead of `zai/glm-5.2`.
+fn build_thought_level_config_option(
+    state: &Result<serde_json::Value, anyhow::Error>,
+) -> Option<acp::SessionConfigOption> {
+    let state = match state {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let active_model = state.get("active_model")?.as_str()?;
+    let available_models = state.get("available_models")?.as_array()?;
+
+    // Find the active model entry to get its reasoning capability.
+    let active_entry = available_models
+        .iter()
+        .find(|m| m.get("name").and_then(|v| v.as_str()) == Some(active_model))?;
+
+    let reasoning = active_entry.get("reasoning")?;
+
+    // Extract effort levels from the reasoning capability.
+    // Two shapes: {"type": "effort", "levels": [...], "default_level": "..."}
+    //          or {"type": "thinking", "can_disable": true} (thinking on/off)
+    let (levels, default_level) =
+        if reasoning.get("type").and_then(|v| v.as_str()) == Some("effort") {
+            let levels = reasoning
+                .get("levels")
+                .and_then(|v| v.as_array())?
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>();
+            let default_level = reasoning
+                .get("default_level")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (levels, default_level)
+        } else if reasoning.get("type").and_then(|v| v.as_str()) == Some("thinking") {
+            // Thinking models have two states: on (default) and off (none).
+            // We map them as "thinking" and "none".
+            (
+                vec!["thinking".to_string(), "none".to_string()],
+                Some("thinking".to_string()),
+            )
+        } else {
+            // no_reasoning or unknown type
+            return None;
+        };
+
+    if levels.is_empty() {
+        return None;
+    }
+
+    // The current thought_level is from active_reasoning_effort, or the default.
+    // For thinking-type models, the daemon uses "t" for thinking-on — normalize to "thinking".
+    let mut current = state
+        .get("active_reasoning_effort")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or(default_level)
+        .unwrap_or_else(|| levels[0].clone());
+
+    // Normalize daemon-specific effort labels to our option values.
+    if current == "t" {
+        current = "thinking".to_string();
+    }
+
+    let options: Vec<acp::SessionConfigSelectOption> = levels
+        .iter()
+        .map(|level| acp::SessionConfigSelectOption::new(level.clone(), level.clone()))
+        .collect();
+
+    Some(
+        acp::SessionConfigOption::select("thought_level", "Thinking", current, options)
+            .category(acp::SessionConfigOptionCategory::ThoughtLevel),
     )
 }
 
@@ -778,6 +869,87 @@ async fn handle_set_session_config_option(
             serde_json::json!({ "facet": value }),
             "facet/mode",
         ),
+        "thought_level" => {
+            // Translate thought_level to a model switch.
+            // The daemon encodes effort in model names: zai/glm-5.2(high)
+            // We need to fetch /state to get the active model name, then
+            // append the effort level.
+            let client = reqwest::Client::new();
+            let state_resp = client
+                .get(format!("{}/state", base_url))
+                .header("Authorization", format!("Bearer {}", bearer))
+                .send()
+                .await;
+
+            let model_with_effort = match state_resp {
+                Ok(r) if r.status().is_success() => {
+                    let state: serde_json::Value = match r.json().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!(error = %e, "Failed to parse /state for thought_level");
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::internal_error().data(
+                                    serde_json::json!({"error": "Failed to read daemon state for thought_level"}),
+                                ),
+                            );
+                        }
+                    };
+                    let active_model = state
+                        .get("active_model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if active_model.is_empty() {
+                        warn!("Cannot set thought_level: no active model");
+                        return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
+                    }
+
+                    // For effort-type models: append (value) to model name
+                    // For thinking-type models: "thinking" → use base model name (no suffix)
+                    //                          "none" → append (none)
+                    let model_with_effort = if value == "thinking" {
+                        // Thinking on = the base model name (default)
+                        active_model.to_string()
+                    } else {
+                        format!("{}({})", active_model, value)
+                    };
+
+                    // Verify this model variant exists in available_models
+                    let available = state
+                        .get("available_models")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let exists = available.iter().any(|m| {
+                        m.get("name").and_then(|v| v.as_str()) == Some(&model_with_effort)
+                    });
+
+                    if !exists {
+                        warn!(
+                            model = %model_with_effort,
+                            "Model variant not found in available_models; trying anyway"
+                        );
+                    }
+
+                    model_with_effort
+                }
+                _ => {
+                    error!("Failed to fetch /state for thought_level");
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(
+                            serde_json::json!({"error": "Failed to fetch daemon state for thought_level"}),
+                        ),
+                    );
+                }
+            };
+
+            (
+                format!("{}/model", base_url),
+                serde_json::json!({ "model": model_with_effort }),
+                "thought_level",
+            )
+        }
         _ => {
             warn!(config_id = %config_id, "Unsupported config option; ignoring");
             return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
@@ -1527,5 +1699,138 @@ impl SseParser {
         }
 
         results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_thought_level_config_option_effort() {
+        let state = serde_json::json!({
+            "active_model": "zai/glm-5.2",
+            "active_reasoning_effort": "high",
+            "available_models": [
+                {
+                    "name": "zai/glm-5.2",
+                    "label": "zai/glm-5.2",
+                    "reasoning": {
+                        "type": "effort",
+                        "effort_set": "zai_glm_5_2",
+                        "levels": ["high", "max", "none"],
+                        "default_level": "high",
+                        "can_disable": true
+                    }
+                }
+            ]
+        });
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        let opt = build_thought_level_config_option(&state_result).unwrap();
+        assert_eq!(opt.id.0.as_ref(), "thought_level");
+        match &opt.kind {
+            acp::SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.0.as_ref(), "high");
+                match &s.options {
+                    acp::SessionConfigSelectOptions::Ungrouped(opts) => {
+                        assert_eq!(opts.len(), 3);
+                    }
+                    _ => panic!("Expected Ungrouped options"),
+                }
+            }
+            _ => panic!("Expected Select kind"),
+        }
+    }
+
+    #[test]
+    fn test_build_thought_level_config_option_thinking() {
+        let state = serde_json::json!({
+            "active_model": "zai/glm-5.1",
+            "active_reasoning_effort": "t",
+            "available_models": [
+                {
+                    "name": "zai/glm-5.1",
+                    "label": "zai/glm-5.1",
+                    "reasoning": {
+                        "type": "thinking",
+                        "can_disable": true
+                    }
+                }
+            ]
+        });
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        let opt = build_thought_level_config_option(&state_result).unwrap();
+        assert_eq!(opt.id.0.as_ref(), "thought_level");
+        match &opt.kind {
+            acp::SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.0.as_ref(), "thinking");
+                match &s.options {
+                    acp::SessionConfigSelectOptions::Ungrouped(opts) => {
+                        assert_eq!(opts.len(), 2);
+                    }
+                    _ => panic!("Expected Ungrouped options"),
+                }
+            }
+            _ => panic!("Expected Select kind"),
+        }
+    }
+
+    #[test]
+    fn test_build_thought_level_config_option_no_reasoning() {
+        let state = serde_json::json!({
+            "active_model": "zai/glm-4.5-air",
+            "available_models": [
+                {
+                    "name": "zai/glm-4.5-air",
+                    "label": "zai/glm-4.5-air",
+                    "reasoning": {"type": "no_reasoning"}
+                }
+            ]
+        });
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        assert!(build_thought_level_config_option(&state_result).is_none());
+    }
+
+    #[test]
+    fn test_build_thought_level_config_option_default_level() {
+        let state = serde_json::json!({
+            "active_model": "zai/glm-5.2",
+            "available_models": [
+                {
+                    "name": "zai/glm-5.2",
+                    "label": "zai/glm-5.2",
+                    "reasoning": {
+                        "type": "effort",
+                        "levels": ["low", "medium", "high"],
+                        "default_level": "medium",
+                        "can_disable": true
+                    }
+                }
+            ]
+        });
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        let opt = build_thought_level_config_option(&state_result).unwrap();
+        match &opt.kind {
+            acp::SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.0.as_ref(), "medium");
+            }
+            _ => panic!("Expected Select kind"),
+        }
+    }
+
+    #[test]
+    fn test_build_thought_level_config_option_model_not_found() {
+        let state = serde_json::json!({
+            "active_model": "nonexistent/model",
+            "available_models": [
+                {
+                    "name": "other/model",
+                    "label": "other/model",
+                    "reasoning": {"type": "no_reasoning"}
+                }
+            ]
+        });
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        assert!(build_thought_level_config_option(&state_result).is_none());
     }
 }
