@@ -251,6 +251,18 @@ async fn handle_new_session(
                 }
             }
 
+            // Send initial Plan with todos from the daemon state.
+            if let Ok(ref ds) = daemon_state {
+                if let Some(plan) = events::build_plan_from_state(ds) {
+                    let sid = acp::SessionId::new(session_id.clone());
+                    let notification =
+                        acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+                    if let Err(e) = cx.send_notification(notification) {
+                        warn!(error = %e, "Failed to send initial Plan notification");
+                    }
+                }
+            }
+
             let mut response = acp::NewSessionResponse::new(session_id);
             if let Some(ms) = &mode_state {
                 response = response.modes(ms.clone());
@@ -1082,6 +1094,113 @@ async fn process_sse_event(
                 .await;
             ConsumeOutcome::Continue
         }
+        EventTranslation::SubagentStarted {
+            handle,
+            subagent_type,
+            model: _,
+        } => {
+            let tool_call = acp::ToolCall::new(handle.clone(), subagent_type.clone())
+                .kind(acp::ToolKind::Think)
+                .status(acp::ToolCallStatus::InProgress);
+            let sid = acp::SessionId::new(session_id.to_string());
+            let notification =
+                acp::SessionNotification::new(sid, acp::SessionUpdate::ToolCall(tool_call));
+            if let Err(e) = conn.send_notification(notification) {
+                error!(error = %e, "Failed to send subagent_started notification");
+            }
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::SubagentCompleted {
+            handle,
+            result_summary,
+        } => {
+            let mut fields =
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed);
+            if let Some(summary) = result_summary {
+                let block: acp::ContentBlock = summary.clone().into();
+                fields = fields.content(vec![acp::ToolCallContent::from(block)]);
+            }
+            let update = acp::ToolCallUpdate::new(handle.clone(), fields);
+            let sid = acp::SessionId::new(session_id.to_string());
+            let notification =
+                acp::SessionNotification::new(sid, acp::SessionUpdate::ToolCallUpdate(update));
+            if let Err(e) = conn.send_notification(notification) {
+                error!(error = %e, "Failed to send subagent_completed notification");
+            }
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::GoalDriverUpdate {
+            transition,
+            summary,
+        } => {
+            let entries = if transition == "cleared" {
+                vec![]
+            } else {
+                vec![acp::PlanEntry::new(
+                    format!("Goal: {}", summary),
+                    acp::PlanEntryPriority::High,
+                    acp::PlanEntryStatus::Pending,
+                )]
+            };
+            let plan = acp::Plan::new(entries);
+            let sid = acp::SessionId::new(session_id.to_string());
+            let notification = acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+            if let Err(e) = conn.send_notification(notification) {
+                error!(error = %e, "Failed to send goal_driver_update notification");
+            }
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::ContextPressure => {
+            // Fetch current usage from /state and send as UsageUpdate
+            if let Some(usage) = fetch_context_usage(base_url, bearer_token).await {
+                let sid = acp::SessionId::new(session_id.to_string());
+                let notification =
+                    acp::SessionNotification::new(sid, acp::SessionUpdate::UsageUpdate(usage));
+                if let Err(e) = conn.send_notification(notification) {
+                    warn!(error = %e, "Failed to send context_pressure usage_update");
+                }
+            }
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::SystemReminder {
+            slug,
+            display_name,
+            body,
+            reason,
+        } => {
+            // Forward as ext notification (one-way, no response expected)
+            let params = serde_json::json!({
+                "slug": slug,
+                "display_name": display_name,
+                "body": body,
+                "reason": reason,
+            });
+            let ext_notif = acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(
+                "_polytoken/system_reminder",
+                std::sync::Arc::from(
+                    serde_json::value::RawValue::from_string(params.to_string()).unwrap_or_else(
+                        |_| serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    ),
+                ),
+            ));
+            // Ext notifications are sent as requests but we don't need the response
+            let _ = conn.send_request(ext_notif);
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::TodoStateChange => {
+            // Re-fetch /state and send an updated Plan
+            if let Some(usage) = fetch_daemon_state_raw(base_url, bearer_token).await {
+                if let Some(plan) = events::build_plan_from_state(&usage) {
+                    let sid = acp::SessionId::new(session_id.to_string());
+                    let notification =
+                        acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+                    if let Err(e) = conn.send_notification(notification) {
+                        error!(error = %e, "Failed to send todo Plan notification");
+                    }
+                }
+            }
+            ConsumeOutcome::Continue
+        }
         EventTranslation::Ignore => ConsumeOutcome::Continue,
     }
 }
@@ -1361,6 +1480,22 @@ async fn fetch_context_usage(base_url: &str, bearer_token: &str) -> Option<acp::
     }
 
     Some(acp::UsageUpdate::new(used, size))
+}
+
+/// Fetch the raw daemon state JSON from `/state`.
+async fn fetch_daemon_state_raw(base_url: &str, bearer_token: &str) -> Option<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/state", base_url);
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
 }
 
 async fn respond_interrogative_permission(

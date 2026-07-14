@@ -101,6 +101,49 @@ pub enum DaemonEvent {
     SessionTitleChanged { title: String },
     #[serde(rename = "facet_changed")]
     FacetChanged { facet: String },
+    #[serde(rename = "session_state_changed")]
+    SessionStateChanged {
+        #[serde(default)]
+        domains: Vec<String>,
+    },
+    #[serde(rename = "todo_status_nudge")]
+    TodoStatusNudge,
+    #[serde(rename = "subagent_started")]
+    SubagentStarted {
+        handle: String,
+        subagent_type: String,
+        model: String,
+    },
+    #[serde(rename = "subagent_completed")]
+    SubagentCompleted {
+        handle: String,
+        #[serde(default)]
+        result_summary: Option<String>,
+    },
+    #[serde(rename = "goal_driver_update")]
+    GoalDriverUpdate {
+        transition: String,
+        #[serde(default)]
+        goal: Option<serde_json::Value>,
+        #[serde(default)]
+        proposed_summary: Option<String>,
+    },
+    #[serde(rename = "context_pressure")]
+    ContextPressure,
+    #[serde(rename = "usage_throttle")]
+    UsageThrottle {
+        prompt_id: String,
+        #[serde(default)]
+        provider: Option<String>,
+    },
+    #[serde(rename = "system_reminder")]
+    SystemReminder {
+        slug: String,
+        display_name: String,
+        body: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     #[serde(rename = "heartbeat")]
     Heartbeat,
     #[serde(other)]
@@ -214,6 +257,30 @@ pub enum EventTranslation {
         interrogative_id: String,
         payload: AskUserQuestionPayload,
     },
+    /// A subagent started — emit a ToolCall.
+    SubagentStarted {
+        handle: String,
+        subagent_type: String,
+        model: String,
+    },
+    /// A subagent completed — emit a ToolCallUpdate.
+    SubagentCompleted {
+        handle: String,
+        result_summary: Option<String>,
+    },
+    /// A goal driver update — emit a Plan with the goal as the first entry.
+    GoalDriverUpdate { transition: String, summary: String },
+    /// A context pressure event — emit a UsageUpdate mid-turn.
+    ContextPressure,
+    /// A system reminder — forward as ext notification.
+    SystemReminder {
+        slug: String,
+        display_name: String,
+        body: String,
+        reason: Option<String>,
+    },
+    /// A todo state change — re-fetch todos and emit a Plan.
+    TodoStateChange,
     /// Nothing to send (heartbeat, unknown, etc.)
     Ignore,
 }
@@ -235,6 +302,14 @@ pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
         DaemonEvent::ModelChanged { .. } => "model_changed",
         DaemonEvent::SessionTitleChanged { .. } => "session_title_changed",
         DaemonEvent::FacetChanged { .. } => "facet_changed",
+        DaemonEvent::SessionStateChanged { .. } => "session_state_changed",
+        DaemonEvent::TodoStatusNudge => "todo_status_nudge",
+        DaemonEvent::SubagentStarted { .. } => "subagent_started",
+        DaemonEvent::SubagentCompleted { .. } => "subagent_completed",
+        DaemonEvent::GoalDriverUpdate { .. } => "goal_driver_update",
+        DaemonEvent::ContextPressure => "context_pressure",
+        DaemonEvent::UsageThrottle { .. } => "usage_throttle",
+        DaemonEvent::SystemReminder { .. } => "system_reminder",
         DaemonEvent::Heartbeat => "heartbeat",
         DaemonEvent::Other => "unknown",
     }
@@ -363,6 +438,49 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
         DaemonEvent::ModelChanged { model } => format!("model={}", model),
         DaemonEvent::SessionTitleChanged { title } => format!("title={}", title),
         DaemonEvent::FacetChanged { facet } => format!("facet={}", facet),
+        DaemonEvent::SessionStateChanged { domains } => {
+            format!("domains={:?}", domains)
+        }
+        DaemonEvent::TodoStatusNudge => String::new(),
+        DaemonEvent::SubagentStarted {
+            handle,
+            subagent_type,
+            model,
+        } => {
+            format!("handle={} type={} model={}", handle, subagent_type, model)
+        }
+        DaemonEvent::SubagentCompleted {
+            handle,
+            result_summary,
+        } => {
+            let summary = result_summary.as_deref().unwrap_or("(none)");
+            format!("handle={} summary={}", handle, summary)
+        }
+        DaemonEvent::GoalDriverUpdate {
+            transition,
+            goal,
+            proposed_summary,
+        } => {
+            let summary = goal
+                .as_ref()
+                .and_then(|g| g.get("summary"))
+                .and_then(|s| s.as_str())
+                .or(proposed_summary.as_deref())
+                .unwrap_or("(none)");
+            format!("transition={} summary={}", transition, summary)
+        }
+        DaemonEvent::ContextPressure => String::new(),
+        DaemonEvent::UsageThrottle {
+            prompt_id,
+            provider,
+        } => {
+            format!("prompt_id={} provider={:?}", prompt_id, provider)
+        }
+        DaemonEvent::SystemReminder {
+            slug, display_name, ..
+        } => {
+            format!("slug={} name={}", slug, display_name)
+        }
         DaemonEvent::Heartbeat => String::new(),
         DaemonEvent::Other => String::new(),
     }
@@ -399,7 +517,8 @@ pub fn event_prompt_id(evt: &DaemonEvent) -> Option<&str> {
         | DaemonEvent::ToolCall { prompt_id, .. }
         | DaemonEvent::ToolResult { prompt_id, .. }
         | DaemonEvent::Interrogative { prompt_id, .. }
-        | DaemonEvent::AskUserQuestion { prompt_id, .. } => Some(prompt_id.as_str()),
+        | DaemonEvent::AskUserQuestion { prompt_id, .. }
+        | DaemonEvent::UsageThrottle { prompt_id, .. } => Some(prompt_id.as_str()),
         _ => None,
     }
 }
@@ -589,7 +708,143 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             EventTranslation::Update(acp::SessionUpdate::CurrentModeUpdate(mode_update))
         }
 
+        // Session state changed → if todos domain, trigger a Plan refresh
+        DaemonEvent::SessionStateChanged { domains } => {
+            if domains.iter().any(|d| d == "todos" || d == "todo") {
+                debug!("session_state_changed includes todos; triggering Plan refresh");
+                EventTranslation::TodoStateChange
+            } else {
+                EventTranslation::Ignore
+            }
+        }
+
+        // Todo status nudge → trigger a Plan refresh
+        DaemonEvent::TodoStatusNudge => {
+            debug!("todo_status_nudge received; triggering Plan refresh");
+            EventTranslation::TodoStateChange
+        }
+
+        // Subagent started → emit as ToolCall with kind=Think
+        DaemonEvent::SubagentStarted {
+            handle,
+            subagent_type,
+            model,
+        } => {
+            debug!(handle = %handle, subagent_type = %subagent_type, "Subagent started");
+            EventTranslation::SubagentStarted {
+                handle: handle.clone(),
+                subagent_type: subagent_type.clone(),
+                model: model.clone(),
+            }
+        }
+
+        // Subagent completed → emit as ToolCallUpdate
+        DaemonEvent::SubagentCompleted {
+            handle,
+            result_summary,
+        } => {
+            debug!(handle = %handle, "Subagent completed");
+            EventTranslation::SubagentCompleted {
+                handle: handle.clone(),
+                result_summary: result_summary.clone(),
+            }
+        }
+
+        // Goal driver update → emit as Plan with goal summary
+        DaemonEvent::GoalDriverUpdate {
+            transition,
+            goal,
+            proposed_summary,
+        } => {
+            let summary = goal
+                .as_ref()
+                .and_then(|g| g.get("summary"))
+                .and_then(|s| s.as_str())
+                .or(proposed_summary.as_deref())
+                .unwrap_or("");
+            if summary.is_empty() && transition != "cleared" {
+                debug!(transition = %transition, "Goal driver update with no summary; ignoring");
+                EventTranslation::Ignore
+            } else {
+                debug!(transition = %transition, summary = %summary, "Goal driver update");
+                EventTranslation::GoalDriverUpdate {
+                    transition: transition.clone(),
+                    summary: summary.to_string(),
+                }
+            }
+        }
+
+        // Context pressure → emit as UsageUpdate mid-turn (agent.rs will fetch /state)
+        DaemonEvent::ContextPressure => {
+            debug!("Context pressure event; will fetch usage from /state");
+            EventTranslation::ContextPressure
+        }
+
+        // Usage throttle → log only (context_pressure handles the usage update)
+        DaemonEvent::UsageThrottle { prompt_id, .. } => {
+            debug!(prompt_id = %prompt_id, "Usage throttle event; ignoring");
+            EventTranslation::Ignore
+        }
+
+        // System reminder → forward as ext notification
+        DaemonEvent::SystemReminder {
+            slug,
+            display_name,
+            body,
+            reason,
+        } => {
+            debug!(slug = %slug, "System reminder; forwarding as ext notification");
+            EventTranslation::SystemReminder {
+                slug: slug.clone(),
+                display_name: display_name.clone(),
+                body: body.clone(),
+                reason: reason.clone(),
+            }
+        }
+
         _ => EventTranslation::Ignore,
+    }
+}
+
+/// Build an ACP Plan from the daemon's `/state` response.
+///
+/// Maps each daemon `TodoSnapshot` to an ACP `PlanEntry`:
+/// - `pending` / `in_progress` / `blocked` → `PlanEntryStatus::Pending`
+/// - `done` → `PlanEntryStatus::Completed`
+/// - `blocked` → `PlanEntryPriority::High`
+/// - `in_progress` → `PlanEntryPriority::High`
+/// - everything else → `PlanEntryPriority::Medium`
+pub fn build_plan_from_state(state: &serde_json::Value) -> Option<acp::Plan> {
+    let todos = state.get("todos")?.as_array()?;
+    if todos.is_empty() {
+        return None;
+    }
+
+    let entries: Vec<acp::PlanEntry> = todos
+        .iter()
+        .filter_map(|todo| {
+            let title = todo.get("title")?.as_str()?.to_string();
+            let status_str = todo.get("status")?.as_str().unwrap_or("pending");
+
+            let status = if status_str == "done" {
+                acp::PlanEntryStatus::Completed
+            } else {
+                acp::PlanEntryStatus::Pending
+            };
+
+            let priority = match status_str {
+                "blocked" | "in_progress" => acp::PlanEntryPriority::High,
+                _ => acp::PlanEntryPriority::Medium,
+            };
+
+            Some(acp::PlanEntry::new(title, priority, status))
+        })
+        .collect();
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(acp::Plan::new(entries))
     }
 }
 
@@ -1510,5 +1765,174 @@ mod tests {
             }
             _ => panic!("Expected ToolCall"),
         }
+    }
+
+    #[test]
+    fn test_build_plan_from_state() {
+        let state = serde_json::json!({
+            "todos": [
+                {"title": "Read file", "status": "done"},
+                {"title": "Edit config", "status": "in_progress"},
+                {"title": "Run tests", "status": "pending"},
+                {"title": "Fix bug", "status": "blocked"},
+            ]
+        });
+        let plan = build_plan_from_state(&state).unwrap();
+        assert_eq!(plan.entries.len(), 4);
+        assert_eq!(plan.entries[0].status, acp::PlanEntryStatus::Completed);
+        assert_eq!(plan.entries[1].status, acp::PlanEntryStatus::Pending);
+        assert_eq!(plan.entries[1].priority, acp::PlanEntryPriority::High);
+        assert_eq!(plan.entries[3].priority, acp::PlanEntryPriority::High);
+    }
+
+    #[test]
+    fn test_build_plan_empty_state() {
+        let state = serde_json::json!({"todos": []});
+        assert!(build_plan_from_state(&state).is_none());
+    }
+
+    #[test]
+    fn test_translate_subagent_started() {
+        let evt = DaemonEvent::SubagentStarted {
+            handle: "general-purpose:abc".into(),
+            subagent_type: "general-purpose".into(),
+            model: "glm-5.2".into(),
+        };
+        match translate_event(&evt) {
+            EventTranslation::SubagentStarted {
+                handle,
+                subagent_type,
+                ..
+            } => {
+                assert_eq!(handle, "general-purpose:abc");
+                assert_eq!(subagent_type, "general-purpose");
+            }
+            _ => panic!("Expected SubagentStarted"),
+        }
+    }
+
+    #[test]
+    fn test_translate_subagent_completed() {
+        let evt = DaemonEvent::SubagentCompleted {
+            handle: "general-purpose:abc".into(),
+            result_summary: Some("Done!".into()),
+        };
+        match translate_event(&evt) {
+            EventTranslation::SubagentCompleted {
+                handle,
+                result_summary,
+            } => {
+                assert_eq!(handle, "general-purpose:abc");
+                assert_eq!(result_summary.as_deref(), Some("Done!"));
+            }
+            _ => panic!("Expected SubagentCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_translate_goal_driver_update() {
+        let evt = DaemonEvent::GoalDriverUpdate {
+            transition: "accepted".into(),
+            goal: Some(serde_json::json!({"summary": "Fix the bug"})),
+            proposed_summary: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::GoalDriverUpdate {
+                transition,
+                summary,
+            } => {
+                assert_eq!(transition, "accepted");
+                assert_eq!(summary, "Fix the bug");
+            }
+            _ => panic!("Expected GoalDriverUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_translate_goal_driver_cleared() {
+        let evt = DaemonEvent::GoalDriverUpdate {
+            transition: "cleared".into(),
+            goal: None,
+            proposed_summary: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::GoalDriverUpdate {
+                transition,
+                summary,
+            } => {
+                assert_eq!(transition, "cleared");
+                assert!(summary.is_empty());
+            }
+            _ => panic!("Expected GoalDriverUpdate for cleared"),
+        }
+    }
+
+    #[test]
+    fn test_translate_session_state_changed_todos() {
+        let evt = DaemonEvent::SessionStateChanged {
+            domains: vec!["todos".to_string()],
+        };
+        assert!(matches!(
+            translate_event(&evt),
+            EventTranslation::TodoStateChange
+        ));
+    }
+
+    #[test]
+    fn test_translate_session_state_changed_other() {
+        let evt = DaemonEvent::SessionStateChanged {
+            domains: vec!["flags".to_string()],
+        };
+        assert!(matches!(translate_event(&evt), EventTranslation::Ignore));
+    }
+
+    #[test]
+    fn test_translate_context_pressure() {
+        let evt = DaemonEvent::ContextPressure;
+        assert!(matches!(
+            translate_event(&evt),
+            EventTranslation::ContextPressure
+        ));
+    }
+
+    #[test]
+    fn test_translate_system_reminder() {
+        let evt = DaemonEvent::SystemReminder {
+            slug: "repo-status".into(),
+            display_name: "Repository status".into(),
+            body: "Working tree: clean".into(),
+            reason: Some("repository_status".into()),
+        };
+        match translate_event(&evt) {
+            EventTranslation::SystemReminder {
+                slug, display_name, ..
+            } => {
+                assert_eq!(slug, "repo-status");
+                assert_eq!(display_name, "Repository status");
+            }
+            _ => panic!("Expected SystemReminder"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_subagent_started() {
+        let json = r#"{"type":"subagent_started","handle":"general-purpose:abc","subagent_type":"general-purpose","model":"glm-5.2"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(evt, DaemonEvent::SubagentStarted { .. }));
+    }
+
+    #[test]
+    fn test_deserialize_goal_driver_update() {
+        let json =
+            r#"{"type":"goal_driver_update","transition":"accepted","goal":{"summary":"Fix it"}}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(evt, DaemonEvent::GoalDriverUpdate { .. }));
+    }
+
+    #[test]
+    fn test_deserialize_system_reminder() {
+        let json = r#"{"type":"system_reminder","slug":"repo-status","display_name":"Repository status","body":"clean","reason":"repository_status"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(evt, DaemonEvent::SystemReminder { .. }));
     }
 }
