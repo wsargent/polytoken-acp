@@ -51,6 +51,14 @@ pub async fn run() {
         .on_receive_request(
             async |_req: acp::InitializeRequest, responder, _cx| {
                 info!("ACP initialize from client");
+                let mut ext_meta = serde_json::Map::new();
+                ext_meta.insert(
+                    "polytoken".to_string(),
+                    serde_json::json!({
+                        "ask_user_question": true,
+                        "system_reminder": true,
+                    }),
+                );
                 let caps = acp::AgentCapabilities::new()
                     .load_session(false)
                     .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
@@ -60,7 +68,8 @@ pub async fn run() {
                             .list(acp::SessionListCapabilities::new())
                             .resume(acp::SessionResumeCapabilities::new())
                             .close(acp::SessionCloseCapabilities::new()),
-                    );
+                    )
+                    .meta(ext_meta);
                 let resp = acp::InitializeResponse::new(_req.protocol_version)
                     .agent_capabilities(caps)
                     .agent_info(

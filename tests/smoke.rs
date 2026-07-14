@@ -166,6 +166,19 @@ async fn test_initialize_capabilities() {
         "must advertise session/close capability"
     );
 
+    // _meta should advertise polytoken extension methods
+    let meta = caps
+        .get("_meta")
+        .expect("missing _meta in agentCapabilities");
+    assert_eq!(
+        meta["polytoken"]["ask_user_question"], true,
+        "_meta must advertise ask_user_question extension"
+    );
+    assert_eq!(
+        meta["polytoken"]["system_reminder"], true,
+        "_meta must advertise system_reminder extension"
+    );
+
     client.kill().await;
 }
 
