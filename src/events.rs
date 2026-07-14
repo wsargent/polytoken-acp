@@ -40,6 +40,8 @@ pub fn parse_sse_event(data: &str) -> Option<DaemonEvent> {
 #[serde(tag = "type")]
 #[allow(dead_code)]
 pub enum DaemonEvent {
+    #[serde(rename = "message_start")]
+    MessageStart { prompt_id: String },
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
         prompt_id: String,
@@ -76,6 +78,8 @@ pub enum DaemonEvent {
         #[serde(default)]
         content: Option<String>,
         #[serde(default)]
+        content_full: Option<String>,
+        #[serde(default)]
         is_error: Option<bool>,
     },
     #[serde(rename = "interrogative")]
@@ -91,6 +95,12 @@ pub enum DaemonEvent {
         interrogative_id: String,
         payload: AskUserQuestionPayload,
     },
+    #[serde(rename = "model_changed")]
+    ModelChanged { model: String },
+    #[serde(rename = "session_title_changed")]
+    SessionTitleChanged { title: String },
+    #[serde(rename = "facet_changed")]
+    FacetChanged { facet: String },
     #[serde(rename = "heartbeat")]
     Heartbeat,
     #[serde(other)]
@@ -191,6 +201,13 @@ pub enum EventTranslation {
         interrogative_id: String,
         question: String,
     },
+    /// A non-permission interrogative (confirmation, clarification, etc.) that
+    /// needs an ACP round-trip via the permission request mechanism.
+    InterrogativeRequest {
+        interrogative_id: String,
+        question: String,
+        interrogative_type: String,
+    },
     /// An ask_user_question request from the daemon that needs an ACP round-trip
     /// via ext_method.
     AskUserQuestion {
@@ -201,10 +218,179 @@ pub enum EventTranslation {
     Ignore,
 }
 
+/// Human-readable type name for a daemon event (for logging).
+pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
+    match evt {
+        DaemonEvent::MessageStart { .. } => "message_start",
+        DaemonEvent::ContentBlockStart { .. } => "content_block_start",
+        DaemonEvent::ContentBlockDelta { .. } => "content_block_delta",
+        DaemonEvent::ContentBlockStop { .. } => "content_block_stop",
+        DaemonEvent::MessageComplete { .. } => "message_complete",
+        DaemonEvent::TurnCancelled { .. } => "turn_cancelled",
+        DaemonEvent::ModelError { .. } => "model_error",
+        DaemonEvent::ToolCall { .. } => "tool_call",
+        DaemonEvent::ToolResult { .. } => "tool_result",
+        DaemonEvent::Interrogative { .. } => "interrogative",
+        DaemonEvent::AskUserQuestion { .. } => "ask_user_question",
+        DaemonEvent::ModelChanged { .. } => "model_changed",
+        DaemonEvent::SessionTitleChanged { .. } => "session_title_changed",
+        DaemonEvent::FacetChanged { .. } => "facet_changed",
+        DaemonEvent::Heartbeat => "heartbeat",
+        DaemonEvent::Other => "unknown",
+    }
+}
+
+/// Human-readable summary of key fields for a daemon event (for logging).
+/// Returns a compact, single-line description suitable for log fields.
+pub fn event_summary(evt: &DaemonEvent) -> String {
+    match evt {
+        DaemonEvent::MessageStart { prompt_id } => format!("prompt_id={}", prompt_id),
+        DaemonEvent::ContentBlockStart {
+            prompt_id,
+            block_index,
+            ..
+        } => {
+            format!("prompt_id={} block_index={}", prompt_id, block_index)
+        }
+        DaemonEvent::ContentBlockDelta {
+            prompt_id,
+            block_index,
+            delta,
+        } => {
+            let delta_desc = match delta {
+                BlockDeltaPayload::TextDelta { text } => {
+                    let preview: String = text.chars().take(80).collect();
+                    format!("text_delta len={} preview={:?}", text.len(), preview)
+                }
+                BlockDeltaPayload::ToolUseInput { partial_json } => {
+                    format!("tool_use_input len={}", partial_json.len())
+                }
+                BlockDeltaPayload::Thinking { text } => {
+                    let preview: String = text.chars().take(80).collect();
+                    format!("thinking len={} preview={:?}", text.len(), preview)
+                }
+                BlockDeltaPayload::SignatureDelta { .. } => "signature_delta".to_string(),
+                BlockDeltaPayload::RedactedThinking { data } => {
+                    format!("redacted_thinking len={}", data.len())
+                }
+                BlockDeltaPayload::OpenAiReasoning { id, data } => {
+                    format!("openai_reasoning id={} len={}", id, data.len())
+                }
+                BlockDeltaPayload::Other => "other_delta".to_string(),
+            };
+            format!(
+                "prompt_id={} block_index={} {}",
+                prompt_id, block_index, delta_desc
+            )
+        }
+        DaemonEvent::ContentBlockStop {
+            prompt_id,
+            block_index,
+        } => {
+            format!("prompt_id={} block_index={}", prompt_id, block_index)
+        }
+        DaemonEvent::MessageComplete { prompt_id } => format!("prompt_id={}", prompt_id),
+        DaemonEvent::TurnCancelled { prompt_id } => format!("prompt_id={}", prompt_id),
+        DaemonEvent::ModelError { prompt_id } => format!("prompt_id={}", prompt_id),
+        DaemonEvent::ToolCall {
+            prompt_id,
+            call_id,
+            name,
+            input,
+            ..
+        } => {
+            let input_desc = match input {
+                Some(v) => {
+                    let s = serde_json::to_string(v).unwrap_or_default();
+                    let preview: String = s.chars().take(120).collect();
+                    format!(" input={}", preview)
+                }
+                None => String::new(),
+            };
+            format!(
+                "prompt_id={} call_id={} name={}{}",
+                prompt_id, call_id, name, input_desc
+            )
+        }
+        DaemonEvent::ToolResult {
+            prompt_id,
+            call_id,
+            content,
+            content_full,
+            is_error,
+            ..
+        } => {
+            let content_desc = if let Some(c) = content_full.as_ref().or(content.as_ref()) {
+                let preview: String = c.chars().take(120).collect();
+                format!(" content={}", preview)
+            } else {
+                String::new()
+            };
+            format!(
+                "prompt_id={} call_id={} is_error={}{}",
+                prompt_id,
+                call_id,
+                is_error.unwrap_or(false),
+                content_desc
+            )
+        }
+        DaemonEvent::Interrogative {
+            prompt_id,
+            interrogative_id,
+            question,
+            interrogative_type,
+            ..
+        } => {
+            let preview: String = question.chars().take(100).collect();
+            format!(
+                "prompt_id={} id={} type={} question={:?}",
+                prompt_id, interrogative_id, interrogative_type, preview
+            )
+        }
+        DaemonEvent::AskUserQuestion {
+            prompt_id,
+            interrogative_id,
+            payload,
+            ..
+        } => {
+            format!(
+                "prompt_id={} id={} questions={}",
+                prompt_id,
+                interrogative_id,
+                payload.questions.len()
+            )
+        }
+        DaemonEvent::ModelChanged { model } => format!("model={}", model),
+        DaemonEvent::SessionTitleChanged { title } => format!("title={}", title),
+        DaemonEvent::FacetChanged { facet } => format!("facet={}", facet),
+        DaemonEvent::Heartbeat => String::new(),
+        DaemonEvent::Other => String::new(),
+    }
+}
+
+/// Human-readable name for an ACP SessionUpdate variant (for logging).
+pub fn session_update_name(update: &acp::SessionUpdate) -> &'static str {
+    match update {
+        acp::SessionUpdate::UserMessageChunk(_) => "user_message_chunk",
+        acp::SessionUpdate::AgentMessageChunk(_) => "agent_message_chunk",
+        acp::SessionUpdate::AgentThoughtChunk(_) => "agent_thought_chunk",
+        acp::SessionUpdate::ToolCall(_) => "tool_call",
+        acp::SessionUpdate::ToolCallUpdate(_) => "tool_call_update",
+        acp::SessionUpdate::Plan(_) => "plan",
+        acp::SessionUpdate::AvailableCommandsUpdate(_) => "available_commands_update",
+        acp::SessionUpdate::CurrentModeUpdate(_) => "current_mode_update",
+        acp::SessionUpdate::ConfigOptionUpdate(_) => "config_option_update",
+        acp::SessionUpdate::SessionInfoUpdate(_) => "session_info_update",
+        acp::SessionUpdate::UsageUpdate(_) => "usage_update",
+        _ => "other",
+    }
+}
+
 /// Extract the prompt_id from a daemon event (if present).
 pub fn event_prompt_id(evt: &DaemonEvent) -> Option<&str> {
     match evt {
-        DaemonEvent::ContentBlockStart { prompt_id, .. }
+        DaemonEvent::MessageStart { prompt_id }
+        | DaemonEvent::ContentBlockStart { prompt_id, .. }
         | DaemonEvent::ContentBlockDelta { prompt_id, .. }
         | DaemonEvent::ContentBlockStop { prompt_id, .. }
         | DaemonEvent::MessageComplete { prompt_id }
@@ -230,7 +416,49 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             let chunk = acp::ContentChunk::new(content_block);
             EventTranslation::Update(acp::SessionUpdate::AgentMessageChunk(chunk))
         }
+
+        // Thinking delta → AgentThoughtChunk
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::Thinking { text },
+            ..
+        } => {
+            let content_block: acp::ContentBlock = text.clone().into();
+            let chunk = acp::ContentChunk::new(content_block);
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(chunk))
+        }
+
+        // Redacted thinking → AgentThoughtChunk (placeholder text)
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::RedactedThinking { data },
+            ..
+        } => {
+            let text = format!("[redacted reasoning: {}]", data);
+            let content_block: acp::ContentBlock = text.into();
+            let chunk = acp::ContentChunk::new(content_block);
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(chunk))
+        }
+
+        // Signature delta → ignore (no ACP equivalent)
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::SignatureDelta { .. },
+            ..
+        } => EventTranslation::Ignore,
+
+        // OpenAI reasoning → AgentThoughtChunk
+        DaemonEvent::ContentBlockDelta {
+            delta: BlockDeltaPayload::OpenAiReasoning { data, .. },
+            ..
+        } => {
+            let content_block: acp::ContentBlock = data.clone().into();
+            let chunk = acp::ContentChunk::new(content_block);
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(chunk))
+        }
+
+        // Other content_block_delta variants → ignore
         DaemonEvent::ContentBlockDelta { .. } => EventTranslation::Ignore,
+
+        // Message start → ignore (no ACP equivalent needed)
+        DaemonEvent::MessageStart { .. } => EventTranslation::Ignore,
 
         // Tool call → ToolCall session update
         DaemonEvent::ToolCall {
@@ -239,10 +467,16 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             input,
             ..
         } => {
+            let kind = tool_kind_for_name(name);
             let mut tool_call = acp::ToolCall::new(call_id.clone(), name.clone())
+                .kind(kind)
                 .status(acp::ToolCallStatus::Pending);
             if let Some(input) = input {
                 tool_call = tool_call.raw_input(input.clone());
+                // Extract file locations from input
+                if let Some(locs) = extract_locations(input) {
+                    tool_call = tool_call.locations(locs);
+                }
             }
             EventTranslation::Update(acp::SessionUpdate::ToolCall(tool_call))
         }
@@ -251,6 +485,7 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
         DaemonEvent::ToolResult {
             call_id,
             content,
+            content_full,
             is_error,
             ..
         } => {
@@ -260,7 +495,9 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                 acp::ToolCallStatus::Completed
             };
             let mut fields = acp::ToolCallUpdateFields::new().status(status);
-            if let Some(c) = &content {
+            // Prefer content_full over content for the tool call output
+            let effective_content = content_full.as_ref().or(content.as_ref());
+            if let Some(c) = effective_content {
                 // Try to parse content as JSON for raw_output
                 if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(c) {
                     fields = fields.raw_output(json_val);
@@ -284,7 +521,7 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             EventTranslation::TurnEnd
         }
 
-        // Interrogative (permission) → forward to ACP client only for permission type
+        // Interrogative (permission) → forward to ACP client
         DaemonEvent::Interrogative {
             interrogative_id,
             question,
@@ -298,8 +535,17 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                     question: question.clone(),
                 }
             } else {
-                warn!(interrogative_type = %interrogative_type, "Non-permission interrogative; auto-responding for v1");
-                EventTranslation::Ignore
+                // Forward non-permission interrogatives (confirmation, clarification,
+                // capability, plan_handoff, goal_proposal) as permission-like requests
+                debug!(
+                    interrogative_type = %interrogative_type,
+                    "Non-permission interrogative from daemon; forwarding to ACP client"
+                );
+                EventTranslation::InterrogativeRequest {
+                    interrogative_id: interrogative_id.clone(),
+                    question: question.clone(),
+                    interrogative_type: interrogative_type.clone(),
+                }
             }
         }
 
@@ -320,7 +566,118 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             }
         }
 
+        // Model changed → send config_option_update so client refreshes model picker
+        DaemonEvent::ModelChanged { model } => {
+            debug!(model = %model, "Model changed; forwarding as session_info_update");
+            // We can't build a full config_option_update here without the full list,
+            // so we send a session_info_update with the model in _meta for clients
+            // that want it. The model config option is already set from /state.
+            EventTranslation::Ignore
+        }
+
+        // Session title changed → forward as session_info_update
+        DaemonEvent::SessionTitleChanged { title } => {
+            debug!(title = %title, "Session title changed; forwarding as session_info_update");
+            let info_update = acp::SessionInfoUpdate::new().title(title.clone());
+            EventTranslation::Update(acp::SessionUpdate::SessionInfoUpdate(info_update))
+        }
+
+        // Facet changed → forward as current_mode_update
+        DaemonEvent::FacetChanged { facet } => {
+            debug!(facet = %facet, "Facet changed; forwarding as current_mode_update");
+            let mode_update = acp::CurrentModeUpdate::new(facet.clone());
+            EventTranslation::Update(acp::SessionUpdate::CurrentModeUpdate(mode_update))
+        }
+
         _ => EventTranslation::Ignore,
+    }
+}
+
+/// Map a daemon tool name to an ACP `ToolKind`.
+///
+/// This lets the ACP client (Paseo) choose the right UI treatment —
+/// read view for file reads, diff view for edits, shell view for commands,
+/// search results for grep/glob, etc.
+fn tool_kind_for_name(name: &str) -> acp::ToolKind {
+    match name {
+        // File reading
+        "file_read" | "file_read_hashline" => acp::ToolKind::Read,
+
+        // File modification
+        "file_edit_search_replace" | "file_edit_hashline" | "patch_edit" | "file_write" => {
+            acp::ToolKind::Edit
+        }
+
+        // Searching
+        "glob" | "grep" => acp::ToolKind::Search,
+
+        // Shell execution
+        "shell_exec" | "shell_monitor" | "pushd" | "popd" => acp::ToolKind::Execute,
+
+        // Job management (subprocess lifecycle)
+        "job_status" | "job_block" | "job_result" | "job_cancel" => acp::ToolKind::Execute,
+
+        // Web fetching
+        "web_fetch" | "web_search" => acp::ToolKind::Fetch,
+
+        // MCP resource reading
+        "mcp_list_resources" | "mcp_read_resource" => acp::ToolKind::Read,
+
+        // Planning / goal management
+        "write_plan" | "edit_plan" | "handoff_plan" | "propose_goal" | "read_goal"
+        | "complete_goal" | "block_goal" => acp::ToolKind::Think,
+
+        // Todo management (internal reasoning)
+        "todo_create" | "todo_update" | "todo_complete" | "todo_delete" | "todo_list" => {
+            acp::ToolKind::Think
+        }
+
+        // Mode switching
+        "switch_facet" => acp::ToolKind::SwitchMode,
+
+        // Tool search / interaction / delegation
+        "tool_search" | "ask_user_question" | "subagent" | "skill" | "flag_important" => {
+            acp::ToolKind::Other
+        }
+
+        _ => acp::ToolKind::Other,
+    }
+}
+
+/// Extract file locations from a tool call's input JSON.
+///
+/// Looks for common path fields (`path`, `filePath`, `file`, `old_path`,
+/// `new_path`) and returns `ToolCallLocation` entries for each found path.
+fn extract_locations(input: &serde_json::Value) -> Option<Vec<acp::ToolCallLocation>> {
+    let obj = input.as_object()?;
+    let mut locations = Vec::new();
+
+    // Primary path fields
+    for key in &["path", "filePath", "file"] {
+        if let Some(path_str) = obj.get(*key).and_then(|v| v.as_str()) {
+            let mut loc = acp::ToolCallLocation::new(path_str.to_string());
+            if let Some(line) = obj
+                .get("line")
+                .or_else(|| obj.get("offset"))
+                .and_then(|v| v.as_u64())
+            {
+                loc = loc.line(line as u32);
+            }
+            locations.push(loc);
+        }
+    }
+
+    // Edit tools may have old_path / new_path
+    for key in &["old_path", "new_path"] {
+        if let Some(path_str) = obj.get(*key).and_then(|v| v.as_str()) {
+            locations.push(acp::ToolCallLocation::new(path_str.to_string()));
+        }
+    }
+
+    if locations.is_empty() {
+        None
+    } else {
+        Some(locations)
     }
 }
 
@@ -356,13 +713,69 @@ pub fn resolve_permission_outcome(outcome: &acp::RequestPermissionOutcome) -> bo
 // Content block text extraction (from ACP prompt)
 // ---------------------------------------------------------------------------
 
-/// Extract joined text from ACP ContentBlock array.
+/// Extract joined text from ACP ContentBlock array, converting non-text blocks
+/// to descriptive placeholders (since the daemon only accepts plain text).
+///
+/// - `Text` blocks are joined directly.
+/// - `Image` blocks become `[image: <mime_type>, <size> bytes]`.
+/// - `ResourceLink` blocks become `[resource: <uri>]` (or `[resource: <name>] (<uri>)`).
+/// - `Resource` blocks become `[embedded resource: <mime_type>]`.
+/// - `Audio` blocks become `[audio: <mime_type>, <size> bytes]`.
 pub fn extract_text(blocks: &[acp::ContentBlock]) -> String {
+    use tracing::warn;
+
     blocks
         .iter()
-        .filter_map(|block| match block {
-            acp::ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
+        .map(|block| match block {
+            acp::ContentBlock::Text(text) => text.text.clone(),
+            acp::ContentBlock::Image(img) => {
+                let size = img.data.len();
+                warn!(
+                    mime_type = %img.mime_type,
+                    bytes = size,
+                    "Image content block in prompt — daemon only accepts text; converting to placeholder"
+                );
+                format!("[image: {}, {} bytes]", img.mime_type, size)
+            }
+            acp::ContentBlock::ResourceLink(link) => {
+                warn!(
+                    uri = %link.uri,
+                    "ResourceLink content block in prompt — daemon only accepts text; converting to placeholder"
+                );
+                match &link.title {
+                    Some(title) => format!("[resource: {}] ({})", title, link.uri),
+                    None => format!("[resource: {}]", link.uri),
+                }
+            }
+            acp::ContentBlock::Resource(resource) => {
+                let mime = match &resource.resource {
+                    acp::EmbeddedResourceResource::TextResourceContents(t) => {
+                        t.mime_type.as_deref().unwrap_or("text/plain")
+                    }
+                    acp::EmbeddedResourceResource::BlobResourceContents(b) => {
+                        b.mime_type.as_deref().unwrap_or("application/octet-stream")
+                    }
+                    _ => "unknown",
+                };
+                warn!(
+                    mime_type = mime,
+                    "Embedded resource in prompt — daemon only accepts text; converting to placeholder"
+                );
+                format!("[embedded resource: {}]", mime)
+            }
+            acp::ContentBlock::Audio(audio) => {
+                let size = audio.data.len();
+                warn!(
+                    mime_type = %audio.mime_type,
+                    bytes = size,
+                    "Audio content block in prompt — daemon only accepts text; converting to placeholder"
+                );
+                format!("[audio: {}, {} bytes]", audio.mime_type, size)
+            }
+            _ => {
+                warn!("Unknown content block type in prompt — dropping");
+                String::new()
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -525,6 +938,7 @@ mod tests {
             prompt_id: "abc".into(),
             call_id: "c1".into(),
             content: Some("result".into()),
+            content_full: None,
             is_error: Some(false),
         };
         match translate_event(&evt) {
@@ -541,6 +955,7 @@ mod tests {
             prompt_id: "abc".into(),
             call_id: "c1".into(),
             content: None,
+            content_full: None,
             is_error: Some(true),
         };
         match translate_event(&evt) {
@@ -636,6 +1051,39 @@ mod tests {
     fn test_extract_text_empty() {
         let blocks: Vec<acp::ContentBlock> = vec![];
         assert_eq!(extract_text(&blocks), "");
+    }
+
+    #[test]
+    fn test_extract_text_with_image() {
+        let blocks = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("Look at this: ")),
+            acp::ContentBlock::Image(acp::ImageContent::new("iVBORw...", "image/png")),
+        ];
+        let result = extract_text(&blocks);
+        assert!(result.contains("Look at this:"));
+        assert!(result.contains("[image: image/png,"));
+    }
+
+    #[test]
+    fn test_extract_text_with_resource_link() {
+        let blocks = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("See file: ")),
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                "main.rs",
+                "file:///src/main.rs",
+            )),
+        ];
+        let result = extract_text(&blocks);
+        assert!(result.contains("See file:"));
+        assert!(result.contains("[resource: file:///src/main.rs]"));
+    }
+
+    #[test]
+    fn test_extract_text_with_resource_link_title() {
+        let link = acp::ResourceLink::new("main.rs", "file:///src/main.rs").title("Main Source");
+        let blocks = vec![acp::ContentBlock::ResourceLink(link)];
+        let result = extract_text(&blocks);
+        assert!(result.contains("[resource: Main Source] (file:///src/main.rs)"));
     }
 
     // ask_user_question tests
@@ -789,5 +1237,278 @@ mod tests {
             back.questions[0].options[0].justification.as_deref(),
             Some("because")
         );
+    }
+
+    #[test]
+    fn test_deserialize_message_start() {
+        let json = r#"{"type":"message_start","prompt_id":"abc"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(evt, DaemonEvent::MessageStart { .. }));
+    }
+
+    #[test]
+    fn test_translate_thinking_delta() {
+        let evt = DaemonEvent::ContentBlockDelta {
+            prompt_id: "abc".into(),
+            block_index: 0,
+            delta: BlockDeltaPayload::Thinking {
+                text: "I should check...".into(),
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(_)) => {}
+            _ => panic!("Expected AgentThoughtChunk"),
+        }
+    }
+
+    #[test]
+    fn test_translate_redacted_thinking_delta() {
+        let evt = DaemonEvent::ContentBlockDelta {
+            prompt_id: "abc".into(),
+            block_index: 0,
+            delta: BlockDeltaPayload::RedactedThinking {
+                data: "opaque".into(),
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(_)) => {}
+            _ => panic!("Expected AgentThoughtChunk for redacted thinking"),
+        }
+    }
+
+    #[test]
+    fn test_translate_openai_reasoning_delta() {
+        let evt = DaemonEvent::ContentBlockDelta {
+            prompt_id: "abc".into(),
+            block_index: 0,
+            delta: BlockDeltaPayload::OpenAiReasoning {
+                id: "r1".into(),
+                data: "reasoning text".into(),
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::AgentThoughtChunk(_)) => {}
+            _ => panic!("Expected AgentThoughtChunk for OpenAI reasoning"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_session_title_changed() {
+        let json = r#"{"type":"session_title_changed","title":"New Title","source":"inferred"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::SessionTitleChanged { title } => {
+                assert_eq!(title, "New Title");
+            }
+            _ => panic!("Expected SessionTitleChanged"),
+        }
+    }
+
+    #[test]
+    fn test_translate_session_title_changed() {
+        let evt = DaemonEvent::SessionTitleChanged {
+            title: "Updated Title".into(),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::SessionInfoUpdate(u)) => {
+                assert_eq!(
+                    u.title.as_opt_ref().unwrap(),
+                    Some(&"Updated Title".to_string())
+                );
+            }
+            _ => panic!("Expected SessionInfoUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_model_changed() {
+        let json = r#"{"type":"model_changed","model":"gpt-4o"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        assert!(matches!(evt, DaemonEvent::ModelChanged { .. }));
+    }
+
+    #[test]
+    fn test_deserialize_facet_changed() {
+        let json = r#"{"type":"facet_changed","facet":"plan"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::FacetChanged { facet } => {
+                assert_eq!(facet, "plan");
+            }
+            _ => panic!("Expected FacetChanged"),
+        }
+    }
+
+    #[test]
+    fn test_translate_facet_changed() {
+        let evt = DaemonEvent::FacetChanged {
+            facet: "plan".into(),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::CurrentModeUpdate(u)) => {
+                assert_eq!(u.current_mode_id.0.as_ref(), "plan");
+            }
+            _ => panic!("Expected CurrentModeUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_translate_interrogative_confirmation() {
+        let evt = DaemonEvent::Interrogative {
+            prompt_id: "abc".into(),
+            interrogative_id: "int_1".into(),
+            question: "Are you sure?".into(),
+            interrogative_type: "confirmation".into(),
+        };
+        match translate_event(&evt) {
+            EventTranslation::InterrogativeRequest {
+                interrogative_type, ..
+            } => {
+                assert_eq!(interrogative_type, "confirmation");
+            }
+            _ => panic!("Expected InterrogativeRequest"),
+        }
+    }
+
+    #[test]
+    fn test_translate_tool_result_content_full() {
+        let evt = DaemonEvent::ToolResult {
+            prompt_id: "abc".into(),
+            call_id: "c1".into(),
+            content: Some("truncated".into()),
+            content_full: Some("full content here".into()),
+            is_error: Some(false),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCallUpdate(u)) => {
+                assert_eq!(u.fields.status, Some(acp::ToolCallStatus::Completed));
+            }
+            _ => panic!("Expected ToolCallUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_file_read() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c1".into(),
+            name: "file_read".into(),
+            input: Some(serde_json::json!({"path": "/tmp/test.rs", "line": 10})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Read);
+                assert_eq!(tc.locations.len(), 1);
+                assert_eq!(
+                    tc.locations[0].path,
+                    std::path::PathBuf::from("/tmp/test.rs")
+                );
+                assert_eq!(tc.locations[0].line, Some(10));
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_file_edit() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c2".into(),
+            name: "file_edit_search_replace".into(),
+            input: Some(serde_json::json!({"path": "/tmp/test.rs"})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Edit);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_shell_exec() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c3".into(),
+            name: "shell_exec".into(),
+            input: Some(serde_json::json!({"command": "ls"})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Execute);
+                // No path fields → no locations
+                assert!(tc.locations.is_empty());
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_grep() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c4".into(),
+            name: "grep".into(),
+            input: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Search);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_web_fetch() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c5".into(),
+            name: "web_fetch".into(),
+            input: Some(serde_json::json!({"url": "https://example.com"})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Fetch);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_tool_kind_for_switch_facet() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c6".into(),
+            name: "switch_facet".into(),
+            input: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::SwitchMode);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_extract_locations_from_edit() {
+        let input = serde_json::json!({
+            "old_path": "/tmp/old.rs",
+            "new_path": "/tmp/new.rs"
+        });
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c7".into(),
+            name: "patch_edit".into(),
+            input: Some(input),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.kind, acp::ToolKind::Edit);
+                assert_eq!(tc.locations.len(), 2);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
     }
 }

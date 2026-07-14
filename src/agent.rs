@@ -370,6 +370,13 @@ async fn handle_prompt(
     let prompt_text = events::extract_text(&req.prompt);
 
     info!(session_id = %session_id, "ACP prompt");
+    tracing::info!(
+        target: "polytoken_acp::conv",
+        session_id = %session_id,
+        prompt_len = prompt_text.len(),
+        prompt_preview = %prompt_text.chars().take(200).collect::<String>(),
+        "prompt_start"
+    );
 
     // Collect connection info without holding lock across await
     let (events_url, bearer_token, base_url) = {
@@ -429,6 +436,12 @@ async fn handle_prompt(
 async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotification) {
     let session_id = notif.session_id.0.to_string();
     info!(session_id = %session_id, "ACP cancel");
+
+    tracing::info!(
+        target: "polytoken_acp::conv",
+        session_id = %session_id,
+        "cancel"
+    );
 
     // We need to take the daemon out briefly to call cancel (which is async).
     // Since we can't hold the lock across await, we clone the necessary bits.
@@ -981,7 +994,15 @@ async fn process_sse_event(
         }
     };
 
-    debug!(event_type = ?std::mem::discriminant(&event), "SSE event received");
+    let event_type = events::event_type_name(&event);
+    let summary = events::event_summary(&event);
+
+    tracing::debug!(
+        target: "polytoken_acp::conv",
+        event_type = event_type,
+        summary = %summary,
+        "daemon_event"
+    );
 
     // Filter by prompt_id if the event has one
     if let Some(epid) = events::event_prompt_id(&event)
@@ -992,6 +1013,12 @@ async fn process_sse_event(
 
     match events::translate_event(&event) {
         EventTranslation::Update(update) => {
+            let update_name = events::session_update_name(&update);
+            tracing::debug!(
+                target: "polytoken_acp::conv",
+                update_type = update_name,
+                "acp_notification"
+            );
             let sid = acp::SessionId::new(session_id.to_string());
             let notification = acp::SessionNotification::new(sid, update.clone());
             if let Err(e) = conn.send_notification(notification) {
@@ -999,8 +1026,22 @@ async fn process_sse_event(
             }
             ConsumeOutcome::Continue
         }
-        EventTranslation::TurnEnd => ConsumeOutcome::Done(acp::StopReason::EndTurn),
-        EventTranslation::TurnCancelled => ConsumeOutcome::Done(acp::StopReason::Cancelled),
+        EventTranslation::TurnEnd => {
+            tracing::info!(
+                target: "polytoken_acp::conv",
+                prompt_id = %prompt_id,
+                "turn_end"
+            );
+            ConsumeOutcome::Done(acp::StopReason::EndTurn)
+        }
+        EventTranslation::TurnCancelled => {
+            tracing::info!(
+                target: "polytoken_acp::conv",
+                prompt_id = %prompt_id,
+                "turn_cancelled"
+            );
+            ConsumeOutcome::Done(acp::StopReason::Cancelled)
+        }
         EventTranslation::PermissionRequest {
             interrogative_id,
             question,
@@ -1009,6 +1050,23 @@ async fn process_sse_event(
                 conn,
                 &interrogative_id,
                 &question,
+                session_id,
+                base_url,
+                bearer_token,
+            )
+            .await;
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::InterrogativeRequest {
+            interrogative_id,
+            question,
+            interrogative_type,
+        } => {
+            handle_interrogative(
+                conn,
+                &interrogative_id,
+                &question,
+                &interrogative_type,
                 session_id,
                 base_url,
                 bearer_token,
@@ -1039,6 +1097,13 @@ async fn handle_permission(
 ) {
     info!(interrogative_id = %interrogative_id, "Forwarding permission request to ACP client");
 
+    tracing::info!(
+        target: "polytoken_acp::conv",
+        interrogative_id = %interrogative_id,
+        question = %question,
+        "permission_request"
+    );
+
     let options = events::build_permission_options();
     let tool_call_update = acp::ToolCallUpdate::new(
         interrogative_id.to_string(),
@@ -1066,9 +1131,104 @@ async fn handle_permission(
 
         info!(interrogative_id = %interrogative_id, granted, "Permission response from client");
 
+        tracing::info!(
+            target: "polytoken_acp::conv",
+            interrogative_id = %interrogative_id,
+            granted,
+            "permission_response"
+        );
+
         if let Err(e) =
             respond_interrogative_permission(&base_url, &bearer_token, &interrogative_id, granted)
                 .await
+        {
+            error!(error = %e, "Failed to respond to interrogative on daemon");
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+/// Forward a non-permission interrogative (confirmation, clarification, etc.)
+/// to the ACP client via `session/request_permission` and relay the response.
+///
+/// For non-permission interrogatives, we map "allow" to a positive answer and
+/// "reject" to a negative answer. The daemon endpoint accepts different response
+/// kinds depending on the interrogative type.
+async fn handle_interrogative(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    question: &str,
+    interrogative_type: &str,
+    session_id: &str,
+    base_url: &str,
+    bearer_token: &str,
+) {
+    info!(
+        interrogative_id = %interrogative_id,
+        interrogative_type = %interrogative_type,
+        "Forwarding interrogative to ACP client"
+    );
+
+    tracing::info!(
+        target: "polytoken_acp::conv",
+        interrogative_id = %interrogative_id,
+        interrogative_type = %interrogative_type,
+        question = %question,
+        "interrogative_request"
+    );
+
+    let options = events::build_permission_options();
+    let tool_call_update = acp::ToolCallUpdate::new(
+        interrogative_id.to_string(),
+        acp::ToolCallUpdateFields::new()
+            .title(question.to_string())
+            .status(acp::ToolCallStatus::Pending),
+    );
+
+    let sid = acp::SessionId::new(session_id.to_string());
+    let request = acp::RequestPermissionRequest::new(sid, tool_call_update, options);
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+    let interrogative_type = interrogative_type.to_string();
+
+    let sent = conn.send_request(request);
+    sent.on_receiving_result(async move |result| {
+        let granted = match result {
+            Ok(response) => events::resolve_permission_outcome(&response.outcome),
+            Err(e) => {
+                error!(error = %e, "Interrogative request failed");
+                false
+            }
+        };
+
+        info!(
+            interrogative_id = %interrogative_id,
+            interrogative_type = %interrogative_type,
+            granted,
+            "Interrogative response from client"
+        );
+
+        tracing::info!(
+            target: "polytoken_acp::conv",
+            interrogative_id = %interrogative_id,
+            interrogative_type = %interrogative_type,
+            granted,
+            "interrogative_response"
+        );
+
+        // Map the ACP permission outcome to the appropriate daemon response kind.
+        if let Err(e) = respond_interrogative_generic(
+            &base_url,
+            &bearer_token,
+            &interrogative_id,
+            &interrogative_type,
+            granted,
+        )
+        .await
         {
             error!(error = %e, "Failed to respond to interrogative on daemon");
         }
@@ -1090,6 +1250,13 @@ async fn handle_ask_user_question(
         interrogative_id = %interrogative_id,
         question_count = payload.questions.len(),
         "Forwarding ask_user_question to ACP client"
+    );
+
+    tracing::info!(
+        target: "polytoken_acp::conv",
+        interrogative_id = %interrogative_id,
+        question_count = payload.questions.len(),
+        "ask_user_question"
     );
 
     let request_json = serde_json::json!({
@@ -1212,6 +1379,53 @@ async fn respond_interrogative_permission(
         .await?;
     if !resp.status().is_success() {
         warn!(status = %resp.status(), "Interrogative response failed");
+    }
+    Ok(())
+}
+
+/// POST a generic interrogative response to the daemon.
+///
+/// Maps the ACP permission outcome (allow/reject) to the appropriate daemon
+/// response kind based on the interrogative type:
+/// - `confirmation` → `{"kind": "confirmation_answer", "confirmed": granted}`
+/// - `capability` → `{"kind": "capability_answer", "granted": granted}`
+/// - `goal_proposal` → `{"kind": "goal_proposal_answer", "accepted": granted}`
+/// - `plan_handoff` → `{"kind": "plan_handoff_answer", "decision": ...}` (best-effort)
+/// - `clarification` → `{"kind": "clarification_choice", "choice": ...}` (best-effort)
+/// - fallback → `{"kind": "cancel"}` (can't meaningfully answer)
+async fn respond_interrogative_generic(
+    base_url: &str,
+    bearer_token: &str,
+    interrogative_id: &str,
+    interrogative_type: &str,
+    granted: bool,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
+
+    let body = match interrogative_type {
+        "confirmation" => serde_json::json!({"kind": "confirmation_answer", "confirmed": granted}),
+        "capability" => serde_json::json!({"kind": "capability_answer", "granted": granted}),
+        "goal_proposal" => serde_json::json!({"kind": "goal_proposal_answer", "accepted": granted}),
+        // For clarification and plan_handoff, we can't fully answer without
+        // structured input from the user. Cancel if rejected; default if granted.
+        _ => {
+            warn!(
+                interrogative_type = %interrogative_type,
+                "Unsupported interrogative type for generic response; cancelling"
+            );
+            serde_json::json!({"kind": "cancel"})
+        }
+    };
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "Generic interrogative response failed");
     }
     Ok(())
 }

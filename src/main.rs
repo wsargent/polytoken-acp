@@ -12,11 +12,23 @@ use tracing::info;
 
 fn main() {
     // Initialize tracing — output goes to stderr ONLY (stdout is JSON-RPC)
+    // All logs are structured JSON (one object per line) for machine consumption.
+    //
+    // The conversation target (polytoken_acp::conv) provides turn-by-turn
+    // conversation monitoring with structured fields like event_type, summary,
+    // prompt_id, etc.
+    //
+    // Override with RUST_LOG, e.g.:
+    //   RUST_LOG=info                       — default conversation monitoring
+    //   RUST_LOG=debug                      — per-event daemon/ACP detail
+    //   RUST_LOG=polytoken_acp::conv=debug  — verbose conversation only
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .json()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,polytoken_acp::conv=info")
+            }),
         )
         .init();
 
