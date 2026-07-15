@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use rand::Rng;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
@@ -83,9 +84,13 @@ impl DaemonHandle {
             .map(|s| s.to_string())
             .unwrap_or_else(generate_session_id);
         let temp_dir = std::env::temp_dir().join(format!("polytoken-acp-{}", session_id));
-        let sessions_dir = temp_dir.join("sessions");
         let log_dir = temp_dir.join("logs");
         let cred_path = temp_dir.join("credential.json");
+
+        // Use polytoken's default persistent sessions directory (~/.local/share/polytoken/sessions/)
+        // so that session history survives process restarts and can be resumed later.
+        // Previously this used a temp dir which got cleaned up by the OS, breaking resume.
+        let sessions_dir = default_sessions_dir();
 
         // Create temp dir with 0700 permissions (polytoken requires it)
         std::fs::create_dir_all(&temp_dir).context("Failed to create temp dir")?;
@@ -95,7 +100,6 @@ impl DaemonHandle {
             std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o700))
                 .context("Failed to set temp dir permissions")?;
         }
-        std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions dir")?;
         std::fs::create_dir_all(&log_dir).context("Failed to create log dir")?;
 
         let bearer_token = generate_token();
@@ -227,21 +231,58 @@ impl DaemonHandle {
         };
 
         // Verify the daemon is responding
+        let mut last_error: Option<String> = None;
+        let mut last_status: Option<u16> = None;
         for attempt in 0..20 {
-            if handle.health().await.unwrap_or(false) {
-                info!(session_id = %handle.session_id, "Daemon is healthy");
-                return Ok(handle);
+            match handle.health().await {
+                Ok(200) => {
+                    info!(session_id = %handle.session_id, "Daemon is healthy");
+                    return Ok(handle);
+                }
+                Ok(status) => {
+                    last_status = Some(status);
+                    last_error = None;
+                }
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    last_status = None;
+                }
             }
-            if attempt == 19 {
-                let _ = handle.child.as_mut().unwrap().kill().await;
-                bail!(
-                    "Daemon startup.json says ready but /health is not responding after 20 attempts"
-                );
+            if attempt < 19 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        unreachable!()
+        // All 20 attempts failed — kill the child and report diagnostics
+        let _ = handle.child.as_mut().unwrap().kill().await;
+        let child_status = match handle.child.as_mut().unwrap().try_wait() {
+            Ok(Some(status)) => format!("exited with status {}", status),
+            Ok(None) => "still running".to_string(),
+            Err(e) => format!("status check failed: {}", e),
+        };
+        match (&last_error, &last_status) {
+            (Some(err), None) => bail!(
+                "Daemon startup.json says ready but /health is not responding after 20 attempts. \
+                 Last transport error: {}. Child process: {}. \
+                 Check daemon logs at {:?}",
+                err,
+                child_status,
+                handle.log_dir
+            ),
+            (None, Some(status)) => bail!(
+                "Daemon startup.json says ready but /health returned HTTP {} after 20 attempts. \
+                 Child process: {}. Check daemon logs at {:?}",
+                status,
+                child_status,
+                handle.log_dir
+            ),
+            _ => bail!(
+                "Daemon startup.json says ready but /health is not responding after 20 attempts. \
+                 Child process: {}. Check daemon logs at {:?}",
+                child_status,
+                handle.log_dir
+            ),
+        }
     }
 
     /// Send a prompt to the daemon using explicit connection params (no borrow needed).
@@ -310,19 +351,17 @@ impl DaemonHandle {
         Ok(())
     }
 
-    /// Check daemon health.
-    pub async fn health(&self) -> Result<bool> {
+    /// Check daemon health by GET /health. Returns the HTTP status code.
+    pub async fn health(&self) -> Result<u16> {
         let client = reqwest::Client::new();
         let url = format!("{}/health", self.base_url);
         let resp = client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.bearer_token))
             .send()
-            .await;
-        match resp {
-            Ok(r) => Ok(r.status().is_success()),
-            Err(_) => Ok(false),
-        }
+            .await
+            .with_context(|| format!("Failed to connect to {} (transport error)", url))?;
+        Ok(resp.status().as_u16())
     }
 
     /// Fetch the daemon's session state snapshot (the subset we need).
@@ -479,6 +518,22 @@ async fn poll_startup(startup_path: &Path) -> Result<u16> {
     }
 }
 
+/// Returns polytoken's default persistent sessions directory.
+///
+/// This is `~/.local/share/polytoken/sessions/` (XDG_DATA_HOME fallback).
+/// Using the default ensures session history survives across polytoken-acp
+/// process restarts so that `--resume` can find the saved `log.jsonl`.
+fn default_sessions_dir() -> PathBuf {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+                .unwrap_or_else(|_| PathBuf::from("~/.local/share"))
+        });
+    data_dir.join("polytoken").join("sessions")
+}
+
 /// Generate a session ID in polytoken's required format:
 /// `{6 Crockford base32 chars}-{word}`
 /// Crockford base32 excludes I, L, O, U to avoid confusion.
@@ -500,17 +555,9 @@ fn generate_session_id() -> String {
 }
 
 fn generate_token() -> String {
+    // Polytoken requires the credential token to be valid base64url.
+    // Generate 48 random bytes and encode as base64url (no padding).
     let mut rng = rand::thread_rng();
-    (0..48)
-        .map(|_| {
-            let c = rng.gen_range(0..62);
-            if c < 26 {
-                (b'a' + c) as char
-            } else if c < 52 {
-                (b'A' + c - 26) as char
-            } else {
-                (b'0' + c - 52) as char
-            }
-        })
-        .collect()
+    let bytes: Vec<u8> = (0..48).map(|_| rng.r#gen()).collect();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
 }
