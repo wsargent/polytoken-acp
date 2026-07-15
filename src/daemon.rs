@@ -326,6 +326,11 @@ impl DaemonHandle {
             .context("Failed to send prompt to daemon")?;
 
         let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("daemon /prompt returned status {}: {}", status, body);
+        }
+
         let body: PromptAcceptedResponse = resp.json().await.context(format!(
             "Failed to parse prompt response (status {})",
             status
