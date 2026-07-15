@@ -55,6 +55,15 @@ The temp directory is passed to the daemon via `--project-config-dir`. The daemo
 
 Each ACP session gets its own temp config directory (random suffix) and its own daemon process. There is no cross-contamination between sessions — if Session A sends servers `[foo, bar]` and Session B sends `[baz]`, each daemon only loads its own servers plus the global ones.
 
+### 4. Cleanup
+
+When a session is closed or the ACP connection is dropped (stdin EOF), `polytoken-acp` calls `terminate()` on the daemon handle, which cleans up:
+
+- **MCP config directory** (`$TMPDIR/polytoken-acp-mcp-<random>/`) — may contain auth tokens.
+- **Daemon temp directory** (`$TMPDIR/polytoken-acp-<session_id>/`) — contains the credential file (bearer token) and logs.
+
+The daemon's persistent sessions directory (`~/.local/share/polytoken/sessions/`) is **not** cleaned up, so session history survives for `--resume`.
+
 ## Transport mapping
 
 | ACP variant | Polytoken transport | Status |
