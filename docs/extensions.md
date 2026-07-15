@@ -165,6 +165,38 @@ ACP `SessionMode` maps to the daemon's **permission monitor**, not facets. This 
 
 Polytoken facets (`execute`, `plan`) are **not** mapped to ACP modes. Instead, `/facet` is advertised as a slash command in `available_commands_update`, so the user can switch facets by typing `/facet plan` or `/facet execute` — matching the TUI experience. The daemon handles the command directly when it appears in a prompt.
 
+#### `_meta.polytoken.choices` on `AvailableCommand`
+
+ACP v1's `AvailableCommandInput` enum has only an `Unstructured` variant (free-text hint). There is no structured-choice variant. To let ACP clients render autocomplete suggestions for the `/facet` command, polytoken-acp embeds the available facet names in the `AvailableCommand._meta` extension field:
+
+```json
+{
+  "name": "facet",
+  "description": "Switch the active facet.",
+  "input": {
+    "type": "Unstructured",
+    "hint": "select an option"
+  },
+  "_meta": {
+    "polytoken": {
+      "choices": ["execute", "plan"]
+    }
+  }
+}
+```
+
+Clients can read `command._meta.polytoken.choices` (a `string[]`) to populate an autocomplete or dropdown UI when the user types `/facet`. If the field is absent or empty, the client should fall back to free-text input.
+
+**Sources:** Facets are discovered from three locations (see the [Facets docs](https://docs.polytoken.dev/harness-engineering/facets/#where-facets-live)):
+
+| Source | Location |
+|---|---|
+| Shipped facets | `polytoken vfs ls polytoken://facets` |
+| Project facets | `<cwd>/.polytoken/facets/*.md` |
+| Global facets | `~/.config/polytoken/facets/*.md` |
+
+Custom facets override shipped facets of the same name. The list is re-discovered on `session_state_changed` events and an updated `available_commands_update` is sent if the set of facets has changed (e.g. after `/daemon-reload`).
+
 ## Session Config Options
 
 In addition to extension methods, `polytoken-acp` exposes daemon settings as standard ACP `SessionConfigOption` entries in the `session/new` and `session/resume` responses. These are not extension methods — they use the ACP session configuration protocol directly.
@@ -185,6 +217,7 @@ Permissions are **not** a config option — they are a session mode (see above).
 | `_polytoken/system_reminder` | ext notification | daemon → client | No | 🔀 PR #17 |
 | Permission modes | SessionMode | bidirectional | No (standard ACP) | ✅ Done |
 | `/facet` command | AvailableCommand | client → daemon | No (prompt passthrough) | ✅ Done |
+| `_meta.polytoken.choices` | AvailableCommand._meta | daemon → client | No (metadata) | ✅ Done |
 
 ## References
 
