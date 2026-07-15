@@ -66,8 +66,9 @@ pub(crate) struct AvailableModelEntry {
 
 impl DaemonHandle {
     /// Spawn a new polytoken daemon for the given working directory.
+    #[allow(dead_code)]
     pub async fn spawn(cwd: &Path) -> Result<DaemonHandle> {
-        Self::spawn_with_session_id(cwd, None).await
+        Self::spawn_with_session_id(cwd, None, None).await
     }
 
     /// Spawn a polytoken daemon, optionally resuming an existing session by ID.
@@ -76,9 +77,14 @@ impl DaemonHandle {
     /// session ID and will load the corresponding session history from its
     /// internal store. A fresh temp directory and credential are always
     /// created for the daemon process itself.
+    ///
+    /// When `project_config_dir` is `Some`, it is passed as
+    /// `--project-config-dir` so the daemon loads an additional project-level
+    /// config layer (used for forwarding ACP-provided MCP servers).
     pub async fn spawn_with_session_id(
         cwd: &Path,
         resume_session_id: Option<&str>,
+        project_config_dir: Option<&Path>,
     ) -> Result<DaemonHandle> {
         let session_id = resume_session_id
             .map(|s| s.to_string())
@@ -154,6 +160,12 @@ impl DaemonHandle {
         // When resuming, pass --resume so the daemon loads saved history.
         if resume_session_id.is_some() {
             cmd.arg("--resume");
+        }
+
+        // When the client provided MCP servers, pass a project-level config dir
+        // so the daemon merges those servers on top of the user's global config.
+        if let Some(config_dir) = project_config_dir {
+            cmd.arg("--project-config-dir").arg(config_dir);
         }
 
         let mut child = cmd

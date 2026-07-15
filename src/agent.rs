@@ -6,6 +6,7 @@
 //! an `Arc<Mutex<>>` captured by each handler closure.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1 as acp;
@@ -225,14 +226,33 @@ async fn handle_new_session(
 ) -> Result<(), agent_client_protocol::Error> {
     info!(cwd = ?req.cwd, "ACP new_session");
 
-    if !req.mcp_servers.is_empty() {
-        warn!(
-            count = req.mcp_servers.len(),
-            "MCP servers passed by client are acknowledged but not forwarded (v1)"
-        );
-    }
+    // Convert ACP-provided MCP servers into a polytoken config file so the
+    // daemon picks them up at startup via --project-config-dir.
+    let mcp_config_dir = if !req.mcp_servers.is_empty() {
+        let session_temp =
+            std::env::temp_dir().join(format!("polytoken-acp-mcp-{:x}", rand::random::<u64>()));
+        match write_mcp_servers_config(&req.mcp_servers, &session_temp) {
+            Some(dir) => {
+                info!(
+                    server_count = req.mcp_servers.len(),
+                    config_dir = ?dir,
+                    "Forwarding MCP servers to daemon"
+                );
+                Some(dir)
+            }
+            None => {
+                warn!(
+                    count = req.mcp_servers.len(),
+                    "MCP servers provided but config generation failed; not forwarding"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    match DaemonHandle::spawn(&req.cwd).await {
+    match DaemonHandle::spawn_with_session_id(&req.cwd, None, mcp_config_dir.as_deref()).await {
         Ok(daemon) => {
             let session_id = daemon.session_id().to_string();
 
@@ -354,6 +374,31 @@ async fn handle_resume_session(
         "ACP session/resume"
     );
 
+    // Convert ACP-provided MCP servers into a polytoken config file.
+    let mcp_config_dir = if !req.mcp_servers.is_empty() {
+        let session_temp =
+            std::env::temp_dir().join(format!("polytoken-acp-mcp-{:x}", rand::random::<u64>()));
+        match write_mcp_servers_config(&req.mcp_servers, &session_temp) {
+            Some(dir) => {
+                info!(
+                    server_count = req.mcp_servers.len(),
+                    config_dir = ?dir,
+                    "Forwarding MCP servers to daemon"
+                );
+                Some(dir)
+            }
+            None => {
+                warn!(
+                    count = req.mcp_servers.len(),
+                    "MCP servers provided but config generation failed; not forwarding"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Check if we already have this session in memory (e.g. resumed twice).
     {
         let sessions = state.lock().unwrap();
@@ -366,7 +411,13 @@ async fn handle_resume_session(
         }
     }
 
-    match DaemonHandle::spawn_with_session_id(&req.cwd, Some(&session_id)).await {
+    match DaemonHandle::spawn_with_session_id(
+        &req.cwd,
+        Some(&session_id),
+        mcp_config_dir.as_deref(),
+    )
+    .await
+    {
         Ok(daemon) => {
             let daemon_state = daemon.fetch_daemon_state().await;
             let permission_monitor = match fetch_permission_monitor_raw(
@@ -536,6 +587,31 @@ async fn handle_load_session(
 
     info!(session_id = %session_id, cwd = ?req.cwd, "ACP session/load");
 
+    // Convert ACP-provided MCP servers into a polytoken config file.
+    let mcp_config_dir = if !req.mcp_servers.is_empty() {
+        let session_temp =
+            std::env::temp_dir().join(format!("polytoken-acp-mcp-{:x}", rand::random::<u64>()));
+        match write_mcp_servers_config(&req.mcp_servers, &session_temp) {
+            Some(dir) => {
+                info!(
+                    server_count = req.mcp_servers.len(),
+                    config_dir = ?dir,
+                    "Forwarding MCP servers to daemon"
+                );
+                Some(dir)
+            }
+            None => {
+                warn!(
+                    count = req.mcp_servers.len(),
+                    "MCP servers provided but config generation failed; not forwarding"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Check if we already have this session in memory.
     {
         let sessions = state.lock().unwrap();
@@ -548,7 +624,13 @@ async fn handle_load_session(
         }
     }
 
-    match DaemonHandle::spawn_with_session_id(&req.cwd, Some(&session_id)).await {
+    match DaemonHandle::spawn_with_session_id(
+        &req.cwd,
+        Some(&session_id),
+        mcp_config_dir.as_deref(),
+    )
+    .await
+    {
         Ok(daemon) => {
             let daemon_state = daemon.fetch_daemon_state().await;
             let permission_monitor = match fetch_permission_monitor_raw(
@@ -1206,6 +1288,167 @@ fn build_mcp_config_options(
             )
         })
         .collect()
+}
+
+/// Convert ACP `McpServer` variants into a polytoken config YAML file and write
+/// it to a temporary directory.
+///
+/// Returns the directory path (suitable for `--project-config-dir`) if any MCP
+/// servers were written, or `None` if the list was empty. The daemon's config
+/// layering merges this project-level config on top of the user's global
+/// config, so existing servers and model keys remain intact.
+///
+/// ACP supports three transport variants — `Stdio`, `Http`, and `Sse` — while
+/// polytoken's config schema only has `stdio` and `http`. SSE is treated as
+/// `http` since polytoken's HTTP transport handles both.
+fn write_mcp_servers_config(mcp_servers: &[acp::McpServer], temp_dir: &Path) -> Option<PathBuf> {
+    if mcp_servers.is_empty() {
+        return None;
+    }
+
+    // Build a serde_yaml::Mapping with mcp_servers as the top-level key.
+    let mut root = serde_yaml::Mapping::new();
+    let mut servers_map = serde_yaml::Mapping::new();
+
+    for server in mcp_servers {
+        match server {
+            acp::McpServer::Stdio(stdio) => {
+                let mut entry = serde_yaml::Mapping::new();
+                entry.insert(
+                    serde_yaml::Value::String("transport".into()),
+                    serde_yaml::Value::String("stdio".into()),
+                );
+                entry.insert(
+                    serde_yaml::Value::String("command".into()),
+                    serde_yaml::Value::String(stdio.command.to_string_lossy().to_string()),
+                );
+                if !stdio.args.is_empty() {
+                    let args: Vec<serde_yaml::Value> = stdio
+                        .args
+                        .iter()
+                        .map(|a| serde_yaml::Value::String(a.clone()))
+                        .collect();
+                    entry.insert(
+                        serde_yaml::Value::String("args".into()),
+                        serde_yaml::Value::Sequence(args),
+                    );
+                }
+                if !stdio.env.is_empty() {
+                    let mut env_map = serde_yaml::Mapping::new();
+                    for var in &stdio.env {
+                        env_map.insert(
+                            serde_yaml::Value::String(var.name.clone()),
+                            serde_yaml::Value::String(var.value.clone()),
+                        );
+                    }
+                    entry.insert(
+                        serde_yaml::Value::String("env".into()),
+                        serde_yaml::Value::Mapping(env_map),
+                    );
+                }
+                servers_map.insert(
+                    serde_yaml::Value::String(stdio.name.clone()),
+                    serde_yaml::Value::Mapping(entry),
+                );
+            }
+            acp::McpServer::Http(http) => {
+                let (name, url, headers) = (&http.name, &http.url, &http.headers);
+                let mut entry = serde_yaml::Mapping::new();
+                entry.insert(
+                    serde_yaml::Value::String("transport".into()),
+                    serde_yaml::Value::String("http".into()),
+                );
+                entry.insert(
+                    serde_yaml::Value::String("url".into()),
+                    serde_yaml::Value::String(url.clone()),
+                );
+                if !headers.is_empty() {
+                    let mut headers_map = serde_yaml::Mapping::new();
+                    for hdr in headers {
+                        headers_map.insert(
+                            serde_yaml::Value::String(hdr.name.clone()),
+                            serde_yaml::Value::String(hdr.value.clone()),
+                        );
+                    }
+                    entry.insert(
+                        serde_yaml::Value::String("headers".into()),
+                        serde_yaml::Value::Mapping(headers_map),
+                    );
+                }
+                servers_map.insert(
+                    serde_yaml::Value::String(name.clone()),
+                    serde_yaml::Value::Mapping(entry),
+                );
+            }
+            acp::McpServer::Sse(sse) => {
+                let (name, url, headers) = (&sse.name, &sse.url, &sse.headers);
+                let mut entry = serde_yaml::Mapping::new();
+                entry.insert(
+                    serde_yaml::Value::String("transport".into()),
+                    serde_yaml::Value::String("http".into()),
+                );
+                entry.insert(
+                    serde_yaml::Value::String("url".into()),
+                    serde_yaml::Value::String(url.clone()),
+                );
+                if !headers.is_empty() {
+                    let mut headers_map = serde_yaml::Mapping::new();
+                    for hdr in headers {
+                        headers_map.insert(
+                            serde_yaml::Value::String(hdr.name.clone()),
+                            serde_yaml::Value::String(hdr.value.clone()),
+                        );
+                    }
+                    entry.insert(
+                        serde_yaml::Value::String("headers".into()),
+                        serde_yaml::Value::Mapping(headers_map),
+                    );
+                }
+                servers_map.insert(
+                    serde_yaml::Value::String(name.clone()),
+                    serde_yaml::Value::Mapping(entry),
+                );
+            }
+            // Polytoken only supports stdio and http transports. Unknown or
+            // future ACP variants (e.g. Acp) are skipped with a warning.
+            _ => {
+                warn!("Skipping unsupported MCP server transport variant");
+            }
+        }
+    }
+
+    root.insert(
+        serde_yaml::Value::String("mcp_servers".into()),
+        serde_yaml::Value::Mapping(servers_map),
+    );
+
+    let config_dir = temp_dir.join("mcp-config");
+    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+        warn!(error = %e, "Failed to create MCP config dir");
+        return None;
+    }
+
+    let config_path = config_dir.join("config.yaml");
+    let yaml_str = match serde_yaml::to_string(&root) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to serialize MCP config YAML");
+            return None;
+        }
+    };
+
+    if let Err(e) = std::fs::write(&config_path, yaml_str) {
+        warn!(error = %e, "Failed to write MCP config file");
+        return None;
+    }
+
+    info!(
+        server_count = mcp_servers.len(),
+        config_path = ?config_path,
+        "Wrote MCP servers to temp config for daemon"
+    );
+
+    Some(config_dir)
 }
 
 async fn handle_list_sessions(
@@ -2668,5 +2911,89 @@ mod tests {
         let ms = build_session_mode_from_permission_monitor(&pm_result)
             .expect("should still return Some with default on error");
         assert_eq!(ms.current_mode_id.0.as_ref(), "standard");
+    }
+
+    #[test]
+    fn test_write_mcp_servers_config_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = write_mcp_servers_config(&[], temp.path());
+        assert!(result.is_none(), "empty list should return None");
+    }
+
+    #[test]
+    fn test_write_mcp_servers_config_stdio() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = acp::McpServer::Stdio(
+            acp::McpServerStdio::new("my-server", "/usr/bin/node")
+                .args(vec!["server.js".into(), "--verbose".into()])
+                .env(vec![acp::EnvVariable::new("API_KEY", "secret123")]),
+        );
+        let config_dir =
+            write_mcp_servers_config(&[server], temp.path()).expect("should return a config dir");
+        let content = std::fs::read_to_string(config_dir.join("config.yaml")).unwrap();
+
+        assert!(content.contains("transport: stdio"));
+        assert!(content.contains("command: /usr/bin/node"));
+        assert!(content.contains("server.js"));
+        assert!(content.contains("--verbose"));
+        assert!(content.contains("API_KEY"));
+        assert!(content.contains("secret123"));
+        assert!(content.contains("my-server"));
+    }
+
+    #[test]
+    fn test_write_mcp_servers_config_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = acp::McpServer::Http(
+            acp::McpServerHttp::new("api-server", "https://api.example.com/mcp").headers(vec![
+                acp::HttpHeader::new("Authorization", "Bearer token123"),
+            ]),
+        );
+        let config_dir =
+            write_mcp_servers_config(&[server], temp.path()).expect("should return a config dir");
+        let content = std::fs::read_to_string(config_dir.join("config.yaml")).unwrap();
+
+        assert!(content.contains("transport: http"));
+        assert!(content.contains("url: https://api.example.com/mcp"));
+        assert!(content.contains("Authorization"));
+        assert!(content.contains("Bearer token123"));
+        assert!(content.contains("api-server"));
+    }
+
+    #[test]
+    fn test_write_mcp_servers_config_sse_treated_as_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = acp::McpServer::Sse(acp::McpServerSse::new(
+            "sse-server",
+            "https://sse.example.com/events",
+        ));
+        let config_dir =
+            write_mcp_servers_config(&[server], temp.path()).expect("should return a config dir");
+        let content = std::fs::read_to_string(config_dir.join("config.yaml")).unwrap();
+
+        // SSE is mapped to http transport since polytoken doesn't have a separate SSE transport
+        assert!(content.contains("transport: http"));
+        assert!(content.contains("url: https://sse.example.com/events"));
+        assert!(content.contains("sse-server"));
+    }
+
+    #[test]
+    fn test_write_mcp_servers_config_multiple() {
+        let temp = tempfile::tempdir().unwrap();
+        let servers = vec![
+            acp::McpServer::Stdio(acp::McpServerStdio::new("local", "/bin/tool")),
+            acp::McpServer::Http(acp::McpServerHttp::new(
+                "remote",
+                "https://remote.example.com/mcp",
+            )),
+        ];
+        let config_dir =
+            write_mcp_servers_config(&servers, temp.path()).expect("should return a config dir");
+        let content = std::fs::read_to_string(config_dir.join("config.yaml")).unwrap();
+
+        assert!(content.contains("local"));
+        assert!(content.contains("remote"));
+        assert!(content.contains("stdio"));
+        assert!(content.contains("http"));
     }
 }
