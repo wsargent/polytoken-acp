@@ -24,18 +24,38 @@ use crate::history;
 /// Shared state across all ACP handlers for one connection.
 struct AgentState {
     sessions: HashMap<String, DaemonHandle>,
+    /// Per-session prompt queue senders. Each session gets a dedicated
+    /// processor task (spawned at session creation) that serializes prompt
+    /// execution. The channel has capacity 1: one in-flight turn + one
+    /// pending. A third prompt is rejected with a structured error.
+    prompt_queues: HashMap<String, tokio::sync::mpsc::Sender<PromptQueueItem>>,
+}
+
+/// A queued prompt awaiting execution by the per-session processor task.
+struct PromptQueueItem {
+    prompt_text: String,
+    session_id: String,
+    events_url: String,
+    bearer_token: String,
+    base_url: String,
+    cwd: std::path::PathBuf,
+    responder: agent_client_protocol::Responder<acp::PromptResponse>,
+    conn: ConnectionTo<Client>,
 }
 
 impl AgentState {
     fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            prompt_queues: HashMap::new(),
         }
     }
 
     /// Take all daemons out of the map and terminate them.
     #[allow(dead_code)]
     async fn shutdown(&mut self) {
+        // Drop all queue senders first — this stops the processor tasks.
+        self.prompt_queues.clear();
         let daemons: Vec<(String, DaemonHandle)> = self.sessions.drain().collect();
         for (_, mut daemon) in daemons {
             daemon.terminate().await;
@@ -281,6 +301,8 @@ async fn handle_new_session(
                 .sessions
                 .insert(session_id.clone(), daemon);
 
+            spawn_prompt_processor(state, &session_id, &cx)?;
+
             info!(session_id = %session_id, "New session created");
 
             // Build and send the session/new response FIRST, before any
@@ -446,6 +468,8 @@ async fn handle_resume_session(
                 .unwrap()
                 .sessions
                 .insert(session_id.clone(), daemon);
+
+            spawn_prompt_processor(state, &session_id, &cx)?;
 
             // Push session state to the client so resumed sessions behave like
             // new sessions — without these notifications the client sees a blank
@@ -695,6 +719,8 @@ async fn handle_load_session(
                 .sessions
                 .insert(session_id.clone(), daemon);
 
+            spawn_prompt_processor(state, &session_id, &cx)?;
+
             // Push session state to the client so loaded sessions behave like
             // new/resumed sessions. These blocks are copied verbatim from
             // handle_resume_session to avoid refactoring existing working
@@ -778,9 +804,12 @@ async fn handle_close_session(
     let session_id = req.session_id.0.to_string();
     info!(session_id = %session_id, "ACP session/close");
 
-    // Remove the daemon from the map and terminate it.
+    // Remove the daemon and prompt queue from the maps.
+    // Dropping the Sender causes the processor task's rx.recv() to return
+    // None, ending the task cleanly.
     let daemon = {
         let mut sessions = state.lock().unwrap();
+        sessions.prompt_queues.remove(&session_id);
         sessions.sessions.remove(&session_id)
     };
 
@@ -815,8 +844,8 @@ async fn handle_prompt(
         "prompt_start"
     );
 
-    // Collect connection info without holding lock across await
-    let (events_url, bearer_token, base_url, cwd) = {
+    // Collect connection info and prompt-queue sender without holding lock across await
+    let (events_url, bearer_token, base_url, cwd, queue_sender) = {
         let sessions = state.lock().unwrap();
         let daemon = match sessions.sessions.get(&session_id) {
             Some(d) => d,
@@ -829,50 +858,149 @@ async fn handle_prompt(
                 );
             }
         };
+        let sender = sessions.prompt_queues.get(&session_id).cloned();
         (
             daemon.events_url(),
             daemon.bearer_token().to_string(),
             daemon.base_url().to_string(),
             daemon.cwd().to_path_buf(),
+            sender,
         )
     };
 
     // Translate `/skillname` → `@skill:skillname` for known skills.
     let prompt_text = translate_skill_invocations(&prompt_text, &cwd);
 
-    // Send prompt to daemon
-    let prompt_id = match DaemonHandle::prompt_with(&base_url, &bearer_token, &prompt_text).await {
-        Ok(id) => id,
-        Err(e) => {
-            error!(error = %e, "Failed to send prompt to daemon");
+    let queue_sender = match queue_sender {
+        Some(s) => s,
+        None => {
+            error!(session_id = %session_id, "No prompt queue for session");
             return responder.respond_with_error(
                 agent_client_protocol::Error::internal_error().data(serde_json::json!({
-                    "error": "Failed to forward prompt to daemon",
-                    "detail": e.to_string(),
+                    "error": "Session is not ready"
                 })),
             );
         }
     };
 
-    info!(session_id = %session_id, prompt_id = %prompt_id, "Prompt forwarded to daemon");
-
-    // Spawn the SSE consumer as a background task.
-    // The responder is moved into the task; when the turn completes,
-    // the task responds with the stop reason.
-    let consumer = SseConsumer {
-        conn: cx.clone(),
+    // Enqueue the prompt. The per-session processor task serializes execution:
+    // it awaits each SseConsumer to completion before picking up the next item.
+    // Channel capacity is 1, so at most one prompt is pending while a turn runs.
+    let item = PromptQueueItem {
+        prompt_text,
         session_id: session_id.clone(),
-        prompt_id: prompt_id.clone(),
         events_url,
         bearer_token,
         base_url,
         cwd,
         responder,
+        conn: cx.clone(),
     };
 
-    cx.spawn(consumer.run())?;
+    match queue_sender.try_send(item) {
+        Ok(()) => {
+            info!(session_id = %session_id, "Prompt queued for processing");
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+            warn!(
+                session_id = %session_id,
+                "Prompt rejected: a turn is active and a prompt is already pending"
+            );
+            item.responder.respond_with_error(
+                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                    "error": "A turn is already active and a prompt is already pending. Please wait for the current turn to complete."
+                })),
+            )
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(item)) => {
+            error!(session_id = %session_id, "Prompt queue closed — session may be shutting down");
+            item.responder
+                .respond_with_error(agent_client_protocol::Error::internal_error().data(
+                    serde_json::json!({
+                        "error": "Session is closing"
+                    }),
+                ))
+        }
+    }
+}
+
+/// Create a per-session prompt queue: spawn the processor task and store the
+/// sender in `AgentState`. Must be called after the daemon is inserted into
+/// `sessions` and before the session response is sent.
+///
+/// The processor task runs on the ACP connection's task spawner and loops:
+/// receive item → `prompt_with` → await `SseConsumer` to completion → repeat.
+/// When all senders are dropped (session closed), `rx.recv()` returns `None`
+/// and the task exits cleanly.
+fn spawn_prompt_processor(
+    state: &Arc<Mutex<AgentState>>,
+    session_id: &str,
+    cx: &ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PromptQueueItem>(1);
+    state
+        .lock()
+        .unwrap()
+        .prompt_queues
+        .insert(session_id.to_string(), tx);
+
+    cx.spawn(async move {
+        while let Some(item) = rx.recv().await {
+            run_prompt_turn(item).await;
+        }
+        // Channel closed — all senders dropped (session closed).
+        Ok(())
+    })?;
 
     Ok(())
+}
+
+/// Execute a single prompt turn: send the prompt to the daemon, then run the
+/// SSE consumer to completion. Called by the per-session processor task.
+async fn run_prompt_turn(item: PromptQueueItem) {
+    let prompt_id = match DaemonHandle::prompt_with(
+        &item.base_url,
+        &item.bearer_token,
+        &item.prompt_text,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!(error = %e, "Failed to send prompt to daemon");
+            let _ = item.responder.respond_with_error(
+                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                    "error": "Failed to forward prompt to daemon",
+                    "detail": e.to_string(),
+                })),
+            );
+            return;
+        }
+    };
+
+    info!(
+        session_id = %item.session_id,
+        prompt_id = %prompt_id,
+        "Prompt forwarded to daemon"
+    );
+
+    let consumer = SseConsumer {
+        conn: item.conn,
+        session_id: item.session_id,
+        prompt_id,
+        events_url: item.events_url,
+        bearer_token: item.bearer_token,
+        base_url: item.base_url,
+        cwd: item.cwd,
+        responder: item.responder,
+    };
+
+    // Await the SSE consumer to completion (do NOT spawn — the processor
+    // task serializes turns by blocking on each consumer).
+    if let Err(e) = consumer.run().await {
+        error!(error = %e, "SseConsumer run failed");
+    }
 }
 
 async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotification) {
@@ -3343,5 +3471,70 @@ mod tests {
         // May include shipped facets from VFS, but project dir is empty.
         // The important invariant: no panics, valid output.
         assert!(facets.iter().all(|f| !f.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_prompt_queue_serializes_turns() {
+        // A capacity-1 channel allows: 1 item being processed (taken by recv)
+        // + 1 item buffered. A third gets rejected with Full.
+        //
+        // In production, the processor task calls rx.recv().await, which frees
+        // the buffer slot. This test simulates that by consuming before sending
+        // the next item.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        // First send fills the buffer slot.
+        tx.try_send("first".to_string()).unwrap();
+
+        // Processor picks up "first" — slot is now free.
+        assert_eq!(rx.recv().await.unwrap(), "first");
+
+        // While "first" is being processed (simulated by not sending yet),
+        // a second prompt arrives — fills the buffer slot.
+        tx.try_send("second".to_string()).unwrap();
+
+        // A third prompt arrives while second is buffered — rejected (Full).
+        let err = tx.try_send("third".to_string()).unwrap_err();
+        assert!(matches!(
+            err,
+            tokio::sync::mpsc::error::TrySendError::Full(_)
+        ));
+
+        // Processor finishes "first", picks up "second".
+        assert_eq!(rx.recv().await.unwrap(), "second");
+
+        // After draining, the slot is free again.
+        tx.try_send("fourth".to_string()).unwrap();
+        assert_eq!(rx.recv().await.unwrap(), "fourth");
+    }
+
+    #[tokio::test]
+    async fn test_prompt_queue_closed_sender() {
+        // When all senders are dropped, recv returns None — processor task exits.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        drop(tx);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prompt_queue_rejects_when_full() {
+        // Simulate the handle_prompt error path: when the channel is full,
+        // try_send returns Full(item) and the caller can recover the item
+        // (including the responder) to send an error response.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        tx.try_send("in-flight".to_string()).unwrap();
+
+        match tx.try_send("pending".to_string()) {
+            Ok(_) => panic!("Expected Full error"),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+                // Verify the item is recovered — in handle_prompt this would
+                // be the PromptQueueItem with the responder
+                assert_eq!(item, "pending");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                panic!("Expected Full, got Closed");
+            }
+        }
     }
 }
