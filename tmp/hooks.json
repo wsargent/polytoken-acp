@@ -1,9 +1,0 @@
-[
-  {
-    "name": "load-search-strategy",
-    "event": "session_start",
-    "handler": {
-      "bash": "jq -Rs '{outcome:\"allow\",additional_context:.}' < \"$HOME/.config/polytoken/skills/search-strategy/SKILL.md\""
-    }
-  }
-]
