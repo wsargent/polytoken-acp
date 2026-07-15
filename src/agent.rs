@@ -1810,6 +1810,29 @@ async fn handle_set_session_mode(
     }
 }
 
+/// Re-fetch daemon state and rebuild the full set of config options.
+///
+/// After a config option is set (e.g. model change), the daemon's state
+/// changes. ACP clients like Paseo expect the `SetSessionConfigOptionResponse`
+/// to include the updated config options so they can refresh their internal
+/// state. Returning an empty vec causes the client to clobber its
+/// `configOptions`, which makes subsequent config option calls fail with
+/// "does not expose ACP thought-level selection".
+async fn rebuild_config_options(base_url: &str, bearer: &str) -> Vec<acp::SessionConfigOption> {
+    let daemon_state = match fetch_daemon_state_raw(base_url, bearer).await {
+        Some(v) => Ok(v),
+        None => Err(anyhow::anyhow!(
+            "failed to fetch daemon state after config option set"
+        )),
+    };
+    let permission_monitor = match fetch_permission_monitor_raw(base_url, bearer).await {
+        Some(v) => Ok(v),
+        None => Err(anyhow::anyhow!("permission-monitor fetch failed")),
+    };
+    let mode_state = build_session_mode_from_permission_monitor(&permission_monitor);
+    build_config_options(&daemon_state, &mode_state, &permission_monitor)
+}
+
 async fn handle_set_session_config_option(
     state: &Arc<Mutex<AgentState>>,
     req: acp::SetSessionConfigOptionRequest,
@@ -1971,7 +1994,17 @@ async fn handle_set_session_config_option(
     match resp {
         Ok(r) if r.status().is_success() => {
             info!(session_id = %session_id, label = %label, value = %value, "Config option set");
-            responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]))
+
+            // Re-fetch daemon state and rebuild config options so the client
+            // receives the updated state (e.g. thought_level currentValue after
+            // a model change). Returning an empty vec causes Paseo to clobber
+            // its configOptions, losing the thought_level option and breaking
+            // subsequent setThinkingOption calls.
+            let updated_config_options = rebuild_config_options(&base_url, &bearer).await;
+
+            responder.respond(acp::SetSessionConfigOptionResponse::new(
+                updated_config_options,
+            ))
         }
         Ok(r) => {
             let status = r.status();
