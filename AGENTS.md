@@ -2,6 +2,12 @@
 
 An [ACP (Agent Client Protocol)](https://agentclientprotocol.com/) server shim for the [Polytoken](https://polytoken.dev) daemon.
 
+## Scope Constraint (read first)
+
+- **Only `polytoken-acp` (this repository) may be modified.** The **Paseo** app (`~/work/paseo`) and the **Polytoken daemon** (the `polytoken` binary) are **off-limits for changes** — they may be read and introspected for understanding, but no feature may depend on modifying either.
+- Practical consequence: any capability that would require a Paseo-side change (e.g. a new consumer for `_polytoken/*` extension notifications) or a daemon-side change (e.g. routing subagent spawning through Paseo's `create_agent` MCP tool) is **out of scope**. Solutions must be fully implementable within the ACP shim.
+- Example: Paseo's collapsible "subagents track" is populated only by real Paseo agents created via the `create_agent` MCP tool (`relationship: subagent`). Making Polytoken subagents appear there would require either a Paseo bridge or a daemon change — both forbidden. Native Polytoken subagents already render as timeline tool calls, matching how Claude Code's native `Task` subagents render; that is the parity available to us.
+
 ## Repository Notes
 
 - **Polytoken is not open source.** There is no public GitHub repository. Do not attempt to read it via GitHub tools (zread MCP, etc.).
