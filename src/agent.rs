@@ -249,6 +249,26 @@ async fn handle_new_session(
 
             info!(session_id = %session_id, "New session created");
 
+            // Build and send the session/new response FIRST, before any
+            // notifications. ACP clients (e.g. Paseo) drop session/update
+            // notifications whose sessionId doesn't match the session they
+            // know about — and they only learn the session ID from the
+            // session/new response. If notifications are sent before the
+            // response, the client hasn't recorded the session ID yet and
+            // discards them (including available_commands_update, which
+            // makes slash commands never appear).
+            let mut response = acp::NewSessionResponse::new(session_id.clone());
+            if let Some(ms) = &mode_state {
+                response = response.modes(ms.clone());
+            }
+            if !config_options.is_empty() {
+                response = response.config_options(config_options);
+            }
+            let respond_result = responder.respond(response);
+
+            // Now send notifications — the client has the session ID from the
+            // response above and will accept these.
+
             // Send session_info_update with the title from the daemon state.
             if let Ok(ref ds) = daemon_state
                 && let Some(title) = ds.get("session_title").and_then(|v| v.as_str())
@@ -296,14 +316,7 @@ async fn handle_new_session(
                 }
             }
 
-            let mut response = acp::NewSessionResponse::new(session_id);
-            if let Some(ms) = &mode_state {
-                response = response.modes(ms.clone());
-            }
-            if !config_options.is_empty() {
-                response = response.config_options(config_options);
-            }
-            responder.respond(response)
+            respond_result
         }
         Err(e) => {
             error!(error = %e, "Failed to spawn daemon");
@@ -407,6 +420,9 @@ async fn handle_resume_session(
             }
 
             info!(session_id = %session_id, "Session resumed");
+
+            // Respond first so the client has the session ID before
+            // notifications arrive (same ordering rationale as new_session).
             let mut response = acp::ResumeSessionResponse::new();
             if let Some(ms) = &mode_state {
                 response = response.modes(ms.clone());
@@ -414,7 +430,56 @@ async fn handle_resume_session(
             if !config_options.is_empty() {
                 response = response.config_options(config_options);
             }
-            responder.respond(response)
+            let respond_result = responder.respond(response);
+
+            // Send session_info_update with the title from the daemon state.
+            if let Ok(ref ds) = daemon_state
+                && let Some(title) = ds.get("session_title").and_then(|v| v.as_str())
+                && !title.is_empty()
+            {
+                let info_update = acp::SessionInfoUpdate::new().title(title.to_string());
+                let sid = acp::SessionId::new(session_id.clone());
+                let notification = acp::SessionNotification::new(
+                    sid,
+                    acp::SessionUpdate::SessionInfoUpdate(info_update),
+                );
+                if let Err(e) = cx.send_notification(notification) {
+                    warn!(error = %e, "Failed to send session_info_update notification");
+                }
+            }
+
+            // Send available_commands_update with the daemon's slash commands and skills.
+            {
+                let mut all_commands = build_available_commands().unwrap_or_default();
+                let skill_commands = build_skill_commands(&daemon_state);
+                all_commands.extend(skill_commands);
+                if !all_commands.is_empty() {
+                    let sid = acp::SessionId::new(session_id.clone());
+                    let notification = acp::SessionNotification::new(
+                        sid,
+                        acp::SessionUpdate::AvailableCommandsUpdate(
+                            acp::AvailableCommandsUpdate::new(all_commands),
+                        ),
+                    );
+                    if let Err(e) = cx.send_notification(notification) {
+                        warn!(error = %e, "Failed to send available_commands_update notification");
+                    }
+                }
+            }
+
+            // Send initial Plan (todos) from daemon state.
+            if let Ok(ref ds) = daemon_state
+                && let Some(plan) = events::build_plan_from_state(ds)
+            {
+                let sid = acp::SessionId::new(session_id.clone());
+                let notification =
+                    acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+                if let Err(e) = cx.send_notification(notification) {
+                    warn!(error = %e, "Failed to send initial Plan notification");
+                }
+            }
+
+            respond_result
         }
         Err(e) => {
             error!(error = %e, session_id = %session_id, "Failed to resume session");

@@ -11,3 +11,14 @@ An [ACP (Agent Client Protocol)](https://agentclientprotocol.com/) server shim f
 - This project uses ACP 1.x (`agent-client-protocol = "1.2"` with the `unstable` feature). The 1.x SDK uses a builder pattern (`Agent.builder().on_receive_request(...).connect_to(Stdio::new())`) instead of the 0.x trait-based API.
 - **`loadSession: true`** — polytoken-acp advertises `loadSession: true` and implements `session/load`. When a client calls `session/load`, polytoken-acp spawns the daemon with `--resume`, fetches history from `GET /history`, and replays each translatable item as an ACP `SessionNotification` before returning the `LoadSessionResponse` with modes and config_options. The `session/resume` handler is kept as a fallback for clients that prefer it.
 - **Stale `startup.json` fix** — `DaemonHandle::spawn_with_session_id` deletes any stale `startup.json` from a previous daemon run before spawning the child process. Without this, `poll_startup` would read the old file on its first iteration and return the dead daemon's port.
+
+## Building & Installing
+
+```bash
+cargo build --release          # build to target/release/polytoken-acp
+cargo install --path . --force # install to ~/.cargo/bin/polytoken-acp
+```
+
+### macOS: do not `cp` to install
+
+On macOS, copying the release binary directly with `cp` (e.g. `cp target/release/polytoken-acp ~/.cargo/bin/`) results in a process that is immediately killed (exit code 137 / SIGKILL). This is caused by the `com.apple.provenance` extended attribute that macOS attaches to manually-copied binaries. Use `cargo install --path . --force` instead, which handles code signing correctly.
