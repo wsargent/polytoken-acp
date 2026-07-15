@@ -1278,8 +1278,16 @@ fn build_thought_level_config_option(
         Err(_) => return None,
     };
 
-    let active_model = state.get("active_model")?.as_str()?;
+    let active_model_raw = state.get("active_model")?.as_str()?;
     let available_models = state.get("available_models")?.as_array()?;
+
+    // The daemon may encode effort in the active model name (e.g.
+    // "zai/glm-5.2(high)"). The available_models entries use the base name
+    // without the suffix, so strip any "(…)" suffix before matching.
+    let active_model = active_model_raw
+        .split('(')
+        .next()
+        .unwrap_or(active_model_raw);
 
     // Find the active model entry to get its reasoning capability.
     let active_entry = available_models
@@ -2855,6 +2863,46 @@ mod tests {
     fn test_build_thought_level_config_option_effort() {
         let state = serde_json::json!({
             "active_model": "zai/glm-5.2",
+            "active_reasoning_effort": "high",
+            "available_models": [
+                {
+                    "name": "zai/glm-5.2",
+                    "label": "zai/glm-5.2",
+                    "reasoning": {
+                        "type": "effort",
+                        "effort_set": "zai_glm_5_2",
+                        "levels": ["high", "max", "none"],
+                        "default_level": "high",
+                        "can_disable": true
+                    }
+                }
+            ]
+        });
+        let state_result: Result<serde_json::Value, anyhow::Error> = Ok(state);
+        let opt = build_thought_level_config_option(&state_result).unwrap();
+        assert_eq!(opt.id.0.as_ref(), "thought_level");
+        match &opt.kind {
+            acp::SessionConfigKind::Select(s) => {
+                assert_eq!(s.current_value.0.as_ref(), "high");
+                match &s.options {
+                    acp::SessionConfigSelectOptions::Ungrouped(opts) => {
+                        assert_eq!(opts.len(), 3);
+                    }
+                    _ => panic!("Expected Ungrouped options"),
+                }
+            }
+            _ => panic!("Expected Select kind"),
+        }
+    }
+
+    #[test]
+    fn test_build_thought_level_config_option_effort_suffix() {
+        // When a reasoning effort is active, the daemon reports active_model
+        // with a "(effort)" suffix (e.g. "zai/glm-5.2(high)"), but
+        // available_models entries use the base name. The builder must strip
+        // the suffix before matching.
+        let state = serde_json::json!({
+            "active_model": "zai/glm-5.2(high)",
             "active_reasoning_effort": "high",
             "available_models": [
                 {
