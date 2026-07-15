@@ -2339,6 +2339,8 @@ async fn process_sse_event(
         EventTranslation::SubagentCompleted {
             handle,
             result_summary,
+            outcome_kind,
+            outcome_message,
         } => {
             // 1. Send standard ACP ToolCallUpdate so Paseo marks it complete.
             let mut fields =
@@ -2359,6 +2361,8 @@ async fn process_sse_event(
             let params = serde_json::json!({
                 "handle": handle,
                 "result_summary": result_summary,
+                "outcome_kind": outcome_kind,
+                "outcome_message": outcome_message,
             });
             send_ext_notification(conn, "_polytoken/subagent_completed", &params);
 
