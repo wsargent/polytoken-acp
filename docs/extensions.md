@@ -146,42 +146,36 @@ const POLYTOKEN_REMINDER_METHOD = "_polytoken/system_reminder";
 
 This is a product decision for the Paseo side.
 
-## Session Config Options
+## Session Modes
 
-In addition to extension methods, `polytoken-acp` exposes daemon settings as standard ACP `SessionConfigOption` entries in the `session/new` and `session/resume` responses. These are not extension methods — they use the ACP session configuration protocol directly.
+ACP `SessionMode` maps to the daemon's **permission monitor**, not facets. This matches how other ACP providers (e.g. Claude Code) expose permission tiers as modes, so Paseo renders them in its built-in mode picker automatically — no custom `configFeatureOption` needed.
 
-### `permissions` (select)
-
-Exposes the daemon's permission monitor mode. The daemon stores this in `GET /permission-monitor` (not `/state`); `polytoken-acp` fetches it at session start and on `permission_monitor_switch` SSE events.
-
-| Option value | Label | Description |
+| Mode | Label | Description |
 |---|---|---|
 | `standard` | Standard | Default permission prompts |
 | `bypass` | Bypass | Skip permission prompts |
 | `bypass_plus` | Bypass+ | Enhanced bypass mode |
 | `autonomous` | Autonomous | Autonomous classifier-based permissions |
 
-- **Config ID:** `permissions`
-- **Category:** `permissions` (custom — not one of ACP's built-in categories)
-- **Routing:** `set_session_config_option(permissions, "bypass")` → `POST /permission-monitor` with `{"mode": "bypass"}`
-- **Live updates:** When the daemon emits `permission_monitor_switch` (e.g. from `/permissions` in the TUI), `polytoken-acp` re-fetches `/state` + `/permission-monitor` and sends a `ConfigOptionUpdate` notification with the full option set.
+- **Source:** `GET /permission-monitor` (response field `monitor.type`)
+- **Routing:** `set_session_mode("bypass")` → `POST /permission-monitor` with `{"mode": "bypass"}`
+- **Live updates:** When the daemon emits `permission_monitor_switch` (e.g. from `/permissions` in the TUI), `polytoken-acp` sends a `CurrentModeUpdate` notification so the client's mode picker reflects the new mode.
 
-### Paseo rendering
+### Facet switching
 
-ACP config options with built-in categories (`mode`, `model`, `thought_level`) are rendered automatically by Paseo. The `permissions` category is custom, so Paseo needs a `configFeatureOption` registered for the polytoken provider to render it:
+Polytoken facets (`execute`, `plan`) are **not** mapped to ACP modes. Instead, `/facet` is advertised as a slash command in `available_commands_update`, so the user can switch facets by typing `/facet plan` or `/facet execute` — matching the TUI experience. The daemon handles the command directly when it appears in a prompt.
 
-```typescript
-// packages/server/src/server/agent/providers/polytoken-acp-agent.ts
-const POLYTOKEN_PERMISSIONS_FEATURE_OPTION: ACPConfigFeatureOption = {
-  id: "permissions",
-  configId: "permissions",
-  category: "permissions",
-  label: "Permissions",
-  description: "How tool call permissions are handled",
-};
-```
+## Session Config Options
 
-Until that Paseo-side change is made, the `permissions` config option is sent over the wire but not rendered in Paseo's UI. See the [Paseo custom providers docs](https://paseo.sh/docs/custom-providers) for how ACP agents are configured.
+In addition to extension methods, `polytoken-acp` exposes daemon settings as standard ACP `SessionConfigOption` entries in the `session/new` and `session/resume` responses. These are not extension methods — they use the ACP session configuration protocol directly.
+
+The available config options are:
+
+- **`model`** (select, category `model`) — model picker from `available_models`
+- **`thought_level`** (select, category `thought_level`) — reasoning effort levels
+- **`mcp:<server>`** (boolean) — one toggle per MCP server
+
+Permissions are **not** a config option — they are a session mode (see above).
 
 ## Summary
 
@@ -189,7 +183,8 @@ Until that Paseo-side change is made, the `permissions` config option is sent ov
 |--------|------|-----------|-------------------|--------|
 | `_polytoken/ask_user_question` | ext request | daemon → client → daemon | Yes (answers array) | ✅ On main |
 | `_polytoken/system_reminder` | ext notification | daemon → client | No | 🔀 PR #17 |
-| `permissions` config option | SessionConfigOption | bidirectional | No (standard ACP) | 🔀 In progress |
+| Permission modes | SessionMode | bidirectional | No (standard ACP) | ✅ Done |
+| `/facet` command | AvailableCommand | client → daemon | No (prompt passthrough) | ✅ Done |
 
 ## References
 

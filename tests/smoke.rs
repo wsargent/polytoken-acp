@@ -196,7 +196,7 @@ fn polytoken_available() -> bool {
 ///
 /// Verifies that:
 /// - session/new returns a session_id
-/// - the response includes modes (execute, plan)
+/// - the response includes modes (standard, bypass, bypass_plus, autonomous)
 /// - the response includes config_options with a model select containing
 ///   at least one option
 ///
@@ -250,12 +250,16 @@ async fn test_session_new() {
         .as_array()
         .expect("availableModes should be an array");
     assert!(
-        available_modes.iter().any(|m| m["id"] == "execute"),
-        "modes should include execute"
+        available_modes.iter().any(|m| m["id"] == "standard"),
+        "modes should include standard"
     );
     assert!(
-        available_modes.iter().any(|m| m["id"] == "plan"),
-        "modes should include plan"
+        available_modes.iter().any(|m| m["id"] == "bypass"),
+        "modes should include bypass"
+    );
+    assert!(
+        available_modes.iter().any(|m| m["id"] == "autonomous"),
+        "modes should include autonomous"
     );
 
     // Config options
@@ -656,19 +660,18 @@ async fn test_session_close() {
     client.kill().await;
 }
 
-/// session/new should include a permissions config option with the 4
-/// permission monitor modes.
+/// session/new should return permission monitor modes as SessionModes.
 ///
 /// Flow: initialize → authenticate → session/new
 /// Verifies:
-/// - configOptions contains an option with id=permissions, type=select
-/// - The select has 4 options: standard, bypass, bypass_plus, autonomous
-/// - The currentValue matches one of the 4 modes
+/// - modes.availableModes includes standard, bypass, bypass_plus, autonomous
+/// - modes.currentModeId matches one of the 4 modes
+/// - configOptions does NOT contain a permissions entry
 ///
-/// Run with: cargo test --test smoke -- --ignored test_permissions_config_option
+/// Run with: cargo test --test smoke -- --ignored test_permissions_mode
 #[tokio::test]
 #[ignore = "Requires polytoken binary + LLM credentials"]
-async fn test_permissions_config_option() {
+async fn test_permissions_mode() {
     if !polytoken_available() {
         eprintln!("SKIP: polytoken binary not on PATH");
         return;
@@ -695,60 +698,56 @@ async fn test_permissions_config_option() {
         .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
         .await;
 
-    let config_options = result["configOptions"]
+    // Modes should include the 4 permission monitor modes
+    let modes = result.get("modes").expect("missing modes");
+    let available_modes = modes["availableModes"]
         .as_array()
-        .expect("missing or non-array configOptions");
+        .expect("availableModes should be an array");
 
-    let permissions_option = config_options
+    let mode_ids: Vec<&str> = available_modes
         .iter()
-        .find(|o| o["id"] == "permissions")
-        .expect("configOptions should contain an option with id=permissions");
-
-    assert_eq!(
-        permissions_option["type"], "select",
-        "permissions config option should be type=select"
-    );
-
-    let options = permissions_option["options"]
-        .as_array()
-        .expect("permissions options should be an array");
-    assert_eq!(
-        options.len(),
-        4,
-        "permissions select should have exactly 4 options"
-    );
-
-    let values: Vec<&str> = options
-        .iter()
-        .map(|o| o["value"].as_str().unwrap())
+        .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert!(values.contains(&"standard"), "missing standard mode");
-    assert!(values.contains(&"bypass"), "missing bypass mode");
-    assert!(values.contains(&"bypass_plus"), "missing bypass_plus mode");
-    assert!(values.contains(&"autonomous"), "missing autonomous mode");
-
-    let current = permissions_option["currentValue"]
-        .as_str()
-        .expect("permissions option should have a currentValue");
+    assert!(mode_ids.contains(&"standard"), "missing standard mode");
+    assert!(mode_ids.contains(&"bypass"), "missing bypass mode");
     assert!(
-        values.contains(&current),
-        "currentValue '{}' should be one of the 4 modes",
+        mode_ids.contains(&"bypass_plus"),
+        "missing bypass_plus mode"
+    );
+    assert!(mode_ids.contains(&"autonomous"), "missing autonomous mode");
+
+    let current = modes["currentModeId"]
+        .as_str()
+        .expect("modes should have currentModeId");
+    assert!(
+        mode_ids.contains(&current),
+        "currentModeId '{}' should be one of the 4 modes",
         current
     );
 
-    eprintln!("Permissions config option verified: current={current}");
+    // configOptions should NOT contain a permissions entry
+    let config_options = result.get("configOptions").and_then(|v| v.as_array());
+    if let Some(opts) = config_options {
+        let has_permissions = opts.iter().any(|o| o["id"] == "permissions");
+        assert!(
+            !has_permissions,
+            "permissions should not be a config option (it's a mode now)"
+        );
+    }
+
+    eprintln!("Permission modes verified: current={current}");
 
     client.kill().await;
 }
 
-/// session/set_config_option with permissions should switch permission mode.
+/// session/set_session_mode with a permission mode should switch the monitor.
 ///
-/// Flow: initialize → authenticate → session/new → set_config_option(permissions, "bypass")
+/// Flow: initialize → authenticate → session/new → set_session_mode("bypass")
 ///
-/// Run with: cargo test --test smoke -- --ignored test_set_permissions_config_option
+/// Run with: cargo test --test smoke -- --ignored test_set_permissions_mode
 #[tokio::test]
 #[ignore = "Requires polytoken binary + LLM credentials"]
-async fn test_set_permissions_config_option() {
+async fn test_set_permissions_mode() {
     if !polytoken_available() {
         eprintln!("SKIP: polytoken binary not on PATH");
         return;
@@ -779,20 +778,19 @@ async fn test_set_permissions_config_option() {
         .expect("missing sessionId")
         .to_string();
 
-    // Set permissions to bypass
+    // Set permissions to bypass via set_session_mode
     let _result = client
         .request(
-            "session/set_config_option",
+            "session/set_session_mode",
             json!({
                 "sessionId": &session_id,
-                "configId": "permissions",
-                "value": "bypass",
+                "modeId": "bypass",
             }),
         )
         .await;
 
-    // If we get here without panic, the config option was accepted.
-    eprintln!("session/set_config_option accepted permissions=bypass");
+    // If we get here without panic, the mode was accepted.
+    eprintln!("session/set_session_mode accepted mode=bypass");
 
     client.kill().await;
 }
