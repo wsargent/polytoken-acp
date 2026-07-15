@@ -951,7 +951,7 @@ fn translate_job_event(
 /// This lets the ACP client (Paseo) choose the right UI treatment —
 /// read view for file reads, diff view for edits, shell view for commands,
 /// search results for grep/glob, etc.
-fn tool_kind_for_name(name: &str) -> acp::ToolKind {
+pub(crate) fn tool_kind_for_name(name: &str) -> acp::ToolKind {
     match name {
         // File reading
         "file_read" | "file_read_hashline" => acp::ToolKind::Read,
@@ -1001,7 +1001,7 @@ fn tool_kind_for_name(name: &str) -> acp::ToolKind {
 ///
 /// Looks for common path fields (`path`, `filePath`, `file`, `old_path`,
 /// `new_path`) and returns `ToolCallLocation` entries for each found path.
-fn extract_locations(input: &serde_json::Value) -> Option<Vec<acp::ToolCallLocation>> {
+pub(crate) fn extract_locations(input: &serde_json::Value) -> Option<Vec<acp::ToolCallLocation>> {
     let obj = input.as_object()?;
     let mut locations = Vec::new();
 

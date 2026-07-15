@@ -7,6 +7,7 @@
 mod agent;
 mod daemon;
 mod events;
+mod history;
 
 use tracing::info;
 

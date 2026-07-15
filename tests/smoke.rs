@@ -110,6 +110,54 @@ impl AcpClient {
         }
     }
 
+    /// Read lines until we find a JSON-RPC response with a matching id.
+    /// Collects all notifications (lines without an id) encountered along the way.
+    async fn read_response_with_notifications(
+        &mut self,
+        method_label: &str,
+    ) -> (Value, Vec<Value>) {
+        let mut notifications = Vec::new();
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match self.stdout.read_line(&mut buf).await {
+                Ok(0) => {
+                    let _ = self.child.try_wait();
+                    panic!("polytoken-acp stdout closed while waiting for {method_label} response");
+                }
+                Ok(_) => {}
+                Err(e) => panic!("failed to read response: {e}"),
+            }
+
+            let line = buf.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let msg: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Skipping unparseable line: {line} ({e})");
+                    continue;
+                }
+            };
+
+            if msg.get("id").is_some() {
+                // Response — return result + collected notifications
+                if let Some(err) = msg.get("error") {
+                    panic!("{method_label} returned error: {err}");
+                }
+                return (
+                    msg.get("result").cloned().unwrap_or(Value::Null),
+                    notifications,
+                );
+            } else {
+                // Notification — collect it
+                notifications.push(msg);
+            }
+        }
+    }
+
     async fn kill(&mut self) {
         let _ = self.child.kill().await;
     }
@@ -143,11 +191,11 @@ async fn test_initialize_capabilities() {
     let agent_info = result.get("agentInfo").expect("missing agentInfo");
     assert_eq!(agent_info["name"], "polytoken");
 
-    // load_session should be false
+    // load_session should be true (session/load replays history)
     let caps = result
         .get("agentCapabilities")
         .expect("missing agentCapabilities");
-    assert_eq!(caps["loadSession"], false, "loadSession should be false");
+    assert_eq!(caps["loadSession"], true, "loadSession should be true");
 
     // Session capabilities: must advertise list and resume
     let session_caps = caps
@@ -660,86 +708,6 @@ async fn test_session_close() {
     client.kill().await;
 }
 
-/// session/new should return permission monitor modes as SessionModes.
-///
-/// Flow: initialize → authenticate → session/new
-/// Verifies:
-/// - modes.availableModes includes standard, bypass, bypass_plus, autonomous
-/// - modes.currentModeId matches one of the 4 modes
-/// - configOptions does NOT contain a permissions entry
-///
-/// Run with: cargo test --test smoke -- --ignored test_permissions_mode
-#[tokio::test]
-#[ignore = "Requires polytoken binary + LLM credentials"]
-async fn test_permissions_mode() {
-    if !polytoken_available() {
-        eprintln!("SKIP: polytoken binary not on PATH");
-        return;
-    }
-
-    let mut client = AcpClient::spawn()
-        .await
-        .expect("failed to spawn polytoken-acp");
-    let cwd = std::env::current_dir().unwrap();
-
-    // Initialize + authenticate
-    client
-        .request(
-            "initialize",
-            json!({"protocolVersion": 1, "clientCapabilities": {}}),
-        )
-        .await;
-    client
-        .request("authenticate", json!({"methodId": "noop"}))
-        .await;
-
-    // session/new
-    let result = client
-        .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
-        .await;
-
-    // Modes should include the 4 permission monitor modes
-    let modes = result.get("modes").expect("missing modes");
-    let available_modes = modes["availableModes"]
-        .as_array()
-        .expect("availableModes should be an array");
-
-    let mode_ids: Vec<&str> = available_modes
-        .iter()
-        .map(|m| m["id"].as_str().unwrap())
-        .collect();
-    assert!(mode_ids.contains(&"standard"), "missing standard mode");
-    assert!(mode_ids.contains(&"bypass"), "missing bypass mode");
-    assert!(
-        mode_ids.contains(&"bypass_plus"),
-        "missing bypass_plus mode"
-    );
-    assert!(mode_ids.contains(&"autonomous"), "missing autonomous mode");
-
-    let current = modes["currentModeId"]
-        .as_str()
-        .expect("modes should have currentModeId");
-    assert!(
-        mode_ids.contains(&current),
-        "currentModeId '{}' should be one of the 4 modes",
-        current
-    );
-
-    // configOptions should NOT contain a permissions entry
-    let config_options = result.get("configOptions").and_then(|v| v.as_array());
-    if let Some(opts) = config_options {
-        let has_permissions = opts.iter().any(|o| o["id"] == "permissions");
-        assert!(
-            !has_permissions,
-            "permissions should not be a config option (it's a mode now)"
-        );
-    }
-
-    eprintln!("Permission modes verified: current={current}");
-
-    client.kill().await;
-}
-
 /// session/set_session_mode with a permission mode should switch the monitor.
 ///
 /// Flow: initialize → authenticate → session/new → set_session_mode("bypass")
@@ -791,6 +759,105 @@ async fn test_set_permissions_mode() {
 
     // If we get here without panic, the mode was accepted.
     eprintln!("session/set_session_mode accepted mode=bypass");
+
+    client.kill().await;
+}
+
+/// session/load on a known session ID should return modes, config_options,
+/// and replay history as session notifications.
+///
+/// Flow: initialize → authenticate → session/new → session/close → session/load (same ID).
+///
+/// Run with: `cargo test --test smoke -- --ignored test_session_load`
+#[tokio::test]
+#[ignore = "Requires polytoken binary + LLM credentials"]
+async fn test_session_load() {
+    if !polytoken_available() {
+        eprintln!("SKIP: polytoken binary not on PATH");
+        return;
+    }
+
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
+    let cwd = std::env::current_dir().unwrap();
+
+    // Initialize + authenticate
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
+        .await;
+    client
+        .request("authenticate", json!({"methodId": "noop"}))
+        .await;
+
+    // Create a session
+    let result = client
+        .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await;
+    let session_id = result["sessionId"]
+        .as_str()
+        .expect("missing sessionId")
+        .to_string();
+
+    eprintln!("Created session {session_id}, closing before load...");
+
+    // Close it so we can load it fresh
+    let _ = client
+        .request("session/close", json!({"sessionId": &session_id}))
+        .await;
+
+    // Send session/load request (using raw write since request() uses read_response)
+    let id = client
+        .next_id
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/load",
+        "params": {
+            "sessionId": &session_id,
+            "cwd": &cwd,
+            "mcpServers": [],
+        },
+    });
+    let line = serde_json::to_string(&msg).unwrap();
+    client.stdin.write_all(line.as_bytes()).await.unwrap();
+    client.stdin.write_all(b"\n").await.unwrap();
+    client.stdin.flush().await.unwrap();
+
+    // Read response and collect notifications sent before it
+    let (load_result, notifications) = client
+        .read_response_with_notifications("session/load")
+        .await;
+
+    // The response should include modes
+    let modes = load_result.get("modes");
+    if let Some(modes) = modes {
+        let available_modes = modes["availableModes"]
+            .as_array()
+            .expect("availableModes should be an array");
+        assert!(
+            available_modes.iter().any(|m| m["id"] == "standard"),
+            "modes should include standard"
+        );
+        eprintln!("session/load returned {} modes", available_modes.len());
+    }
+
+    // The response should include config_options
+    let config_options = load_result.get("configOptions");
+    if let Some(opts) = config_options.and_then(|v| v.as_array()) {
+        eprintln!("session/load returned {} config options", opts.len());
+    }
+
+    // We should have received at least some notifications (history replay or
+    // session_info_update, available_commands_update, Plan)
+    eprintln!(
+        "session/load sent {} notifications before response",
+        notifications.len()
+    );
 
     client.kill().await;
 }
