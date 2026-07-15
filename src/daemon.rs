@@ -26,10 +26,12 @@ pub struct DaemonHandle {
     child: Option<Child>,
     #[allow(dead_code)]
     sessions_dir: PathBuf,
-    #[allow(dead_code)]
-    log_dir: PathBuf,
-    #[allow(dead_code)]
-    cred_path: PathBuf,
+    /// Temp directory for the daemon process: contains credential file and
+    /// logs. Cleaned up on terminate.
+    temp_dir: PathBuf,
+    /// Temp directory containing MCP server config forwarded from the ACP
+    /// client. Cleaned up on terminate.
+    mcp_config_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -252,8 +254,8 @@ impl DaemonHandle {
             cwd: cwd.to_path_buf(),
             child: Some(child),
             sessions_dir,
-            log_dir,
-            cred_path,
+            temp_dir,
+            mcp_config_dir: None,
         };
 
         // Verify the daemon is responding
@@ -293,20 +295,20 @@ impl DaemonHandle {
                  Check daemon logs at {:?}",
                 err,
                 child_status,
-                handle.log_dir
+                log_dir
             ),
             (None, Some(status)) => bail!(
                 "Daemon startup.json says ready but /health returned HTTP {} after 20 attempts. \
                  Child process: {}. Check daemon logs at {:?}",
                 status,
                 child_status,
-                handle.log_dir
+                log_dir
             ),
             _ => bail!(
                 "Daemon startup.json says ready but /health is not responding after 20 attempts. \
                  Child process: {}. Check daemon logs at {:?}",
                 child_status,
-                handle.log_dir
+                log_dir
             ),
         }
     }
@@ -453,6 +455,11 @@ impl DaemonHandle {
         &self.cwd
     }
 
+    /// Set the MCP config dir to clean up on terminate.
+    pub fn set_mcp_config_dir(&mut self, dir: PathBuf) {
+        self.mcp_config_dir = Some(dir);
+    }
+
     /// Switch the active facet by POSTing to `/facet`.
     #[allow(dead_code)]
     pub async fn set_facet(&self, facet: &str) -> Result<()> {
@@ -504,6 +511,25 @@ impl DaemonHandle {
         if let Some(child) = &mut self.child {
             let _ = child.kill().await;
         }
+
+        // Clean up the temp MCP config directory (may contain auth tokens).
+        if let Some(ref mcp_dir) = self.mcp_config_dir {
+            if let Err(e) = std::fs::remove_dir_all(mcp_dir) {
+                debug!(path = ?mcp_dir, error = %e, "Failed to clean up MCP config dir");
+            } else {
+                debug!(path = ?mcp_dir, "Cleaned up MCP config dir");
+            }
+        }
+
+        // Clean up the daemon's temp directory (credential file and logs).
+        // The credential file contains a bearer token, so remove it even if
+        // the daemon process was already killed.
+        if let Err(e) = std::fs::remove_dir_all(&self.temp_dir) {
+            debug!(path = ?self.temp_dir, error = %e, "Failed to clean up daemon temp dir");
+        } else {
+            debug!(path = ?self.temp_dir, "Cleaned up daemon temp dir");
+        }
+
         info!(session_id = %self.session_id, "Daemon terminated");
     }
 }

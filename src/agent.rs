@@ -253,7 +253,7 @@ async fn handle_new_session(
     };
 
     match DaemonHandle::spawn_with_session_id(&req.cwd, None, mcp_config_dir.as_deref()).await {
-        Ok(daemon) => {
+        Ok(mut daemon) => {
             let session_id = daemon.session_id().to_string();
 
             // Fetch daemon state once, then build modes and config options from it.
@@ -270,6 +270,10 @@ async fn handle_new_session(
             let mode_state = build_session_mode_from_permission_monitor(&permission_monitor);
             let config_options =
                 build_config_options(&daemon_state, &mode_state, &permission_monitor);
+
+            if let Some(dir) = &mcp_config_dir {
+                daemon.set_mcp_config_dir(dir.clone());
+            }
 
             state
                 .lock()
@@ -418,7 +422,7 @@ async fn handle_resume_session(
     )
     .await
     {
-        Ok(daemon) => {
+        Ok(mut daemon) => {
             let daemon_state = daemon.fetch_daemon_state().await;
             let permission_monitor = match fetch_permission_monitor_raw(
                 daemon.base_url(),
@@ -432,6 +436,10 @@ async fn handle_resume_session(
             let mode_state = build_session_mode_from_permission_monitor(&permission_monitor);
             let config_options =
                 build_config_options(&daemon_state, &mode_state, &permission_monitor);
+
+            if let Some(dir) = &mcp_config_dir {
+                daemon.set_mcp_config_dir(dir.clone());
+            }
 
             state
                 .lock()
@@ -631,7 +639,7 @@ async fn handle_load_session(
     )
     .await
     {
-        Ok(daemon) => {
+        Ok(mut daemon) => {
             let daemon_state = daemon.fetch_daemon_state().await;
             let permission_monitor = match fetch_permission_monitor_raw(
                 daemon.base_url(),
@@ -677,6 +685,10 @@ async fn handle_load_session(
             }
 
             // Insert the daemon into the state map (after history fetch).
+            if let Some(dir) = &mcp_config_dir {
+                daemon.set_mcp_config_dir(dir.clone());
+            }
+
             state
                 .lock()
                 .unwrap()
@@ -1299,8 +1311,10 @@ fn build_mcp_config_options(
 /// config, so existing servers and model keys remain intact.
 ///
 /// ACP supports three transport variants — `Stdio`, `Http`, and `Sse` — while
-/// polytoken's config schema only has `stdio` and `http`. SSE is treated as
-/// `http` since polytoken's HTTP transport handles both.
+/// polytoken's config schema only has `stdio` and `http` (streamable-HTTP).
+/// `Stdio` maps directly; `Http` maps to polytoken's `http` transport. The
+/// `Sse` variant is **skipped** because SSE and streamable-HTTP are
+/// different MCP protocols — polytoken has no SSE transport.
 fn write_mcp_servers_config(mcp_servers: &[acp::McpServer], temp_dir: &Path) -> Option<PathBuf> {
     if mcp_servers.is_empty() {
         return None;
@@ -1346,6 +1360,26 @@ fn write_mcp_servers_config(mcp_servers: &[acp::McpServer], temp_dir: &Path) -> 
                         serde_yaml::Value::Mapping(env_map),
                     );
                 }
+
+                // ACP stdio servers may expect the full parent environment
+                // (e.g. NODE_PATH, DYLD_*, provider keys). Polytoken's
+                // default pass_env is restrictive (HOME, PATH, LANG, TMPDIR),
+                // so we explicitly list every env var from the current
+                // process. Explicit `env` values above override these.
+                let pass_env_names: Vec<serde_yaml::Value> = std::env::vars()
+                    .map(|(k, _)| serde_yaml::Value::String(k))
+                    .collect();
+                entry.insert(
+                    serde_yaml::Value::String("pass_env".into()),
+                    serde_yaml::Value::Sequence(pass_env_names),
+                );
+
+                // Log stdout so connection issues are visible. Polytoken
+                // logs stderr by default but stdout is off by default.
+                entry.insert(
+                    serde_yaml::Value::String("log_stdout".into()),
+                    serde_yaml::Value::Bool(true),
+                );
                 servers_map.insert(
                     serde_yaml::Value::String(stdio.name.clone()),
                     serde_yaml::Value::Mapping(entry),
@@ -1362,51 +1396,59 @@ fn write_mcp_servers_config(mcp_servers: &[acp::McpServer], temp_dir: &Path) -> 
                     serde_yaml::Value::String("url".into()),
                     serde_yaml::Value::String(url.clone()),
                 );
-                if !headers.is_empty() {
-                    let mut headers_map = serde_yaml::Mapping::new();
-                    for hdr in headers {
+
+                // Separate the Authorization header from the rest.
+                // Polytoken has a dedicated `auth` field for credential
+                // storage; using it avoids putting tokens in the generic
+                // `headers` map and lets polytoken handle auth lifecycle.
+                let mut auth_value: Option<String> = None;
+                let mut headers_map = serde_yaml::Mapping::new();
+                for hdr in headers {
+                    if hdr.name.eq_ignore_ascii_case("authorization") {
+                        auth_value = Some(hdr.value.clone());
+                    } else {
                         headers_map.insert(
                             serde_yaml::Value::String(hdr.name.clone()),
                             serde_yaml::Value::String(hdr.value.clone()),
                         );
                     }
+                }
+
+                if let Some(value) = auth_value {
+                    let mut auth_map = serde_yaml::Mapping::new();
+                    auth_map.insert(
+                        serde_yaml::Value::String("type".into()),
+                        serde_yaml::Value::String("authorization-header".into()),
+                    );
+                    auth_map.insert(
+                        serde_yaml::Value::String("value".into()),
+                        serde_yaml::Value::String(value),
+                    );
+                    entry.insert(
+                        serde_yaml::Value::String("auth".into()),
+                        serde_yaml::Value::Mapping(auth_map),
+                    );
+                }
+
+                if !headers_map.is_empty() {
                     entry.insert(
                         serde_yaml::Value::String("headers".into()),
                         serde_yaml::Value::Mapping(headers_map),
                     );
                 }
+
                 servers_map.insert(
                     serde_yaml::Value::String(name.clone()),
                     serde_yaml::Value::Mapping(entry),
                 );
             }
+            // Polytoken does not support the SSE transport — it only has
+            // stdio and streamable-HTTP. SSE and streamable-HTTP are
+            // different MCP transports, so we cannot map Sse to http.
             acp::McpServer::Sse(sse) => {
-                let (name, url, headers) = (&sse.name, &sse.url, &sse.headers);
-                let mut entry = serde_yaml::Mapping::new();
-                entry.insert(
-                    serde_yaml::Value::String("transport".into()),
-                    serde_yaml::Value::String("http".into()),
-                );
-                entry.insert(
-                    serde_yaml::Value::String("url".into()),
-                    serde_yaml::Value::String(url.clone()),
-                );
-                if !headers.is_empty() {
-                    let mut headers_map = serde_yaml::Mapping::new();
-                    for hdr in headers {
-                        headers_map.insert(
-                            serde_yaml::Value::String(hdr.name.clone()),
-                            serde_yaml::Value::String(hdr.value.clone()),
-                        );
-                    }
-                    entry.insert(
-                        serde_yaml::Value::String("headers".into()),
-                        serde_yaml::Value::Mapping(headers_map),
-                    );
-                }
-                servers_map.insert(
-                    serde_yaml::Value::String(name.clone()),
-                    serde_yaml::Value::Mapping(entry),
+                warn!(
+                    server_name = %sse.name,
+                    "Skipping SSE MCP server: polytoken does not support the SSE transport"
                 );
             }
             // Polytoken only supports stdio and http transports. Unknown or
@@ -1427,6 +1469,12 @@ fn write_mcp_servers_config(mcp_servers: &[acp::McpServer], temp_dir: &Path) -> 
         warn!(error = %e, "Failed to create MCP config dir");
         return None;
     }
+    // Restrict to owner-only: the config may contain auth tokens.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).ok();
+    }
 
     let config_path = config_dir.join("config.yaml");
     let yaml_str = match serde_yaml::to_string(&root) {
@@ -1440,6 +1488,12 @@ fn write_mcp_servers_config(mcp_servers: &[acp::McpServer], temp_dir: &Path) -> 
     if let Err(e) = std::fs::write(&config_path, yaml_str) {
         warn!(error = %e, "Failed to write MCP config file");
         return None;
+    }
+    // Restrict to owner-only: the config may contain auth tokens.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).ok();
     }
 
     info!(
@@ -2939,6 +2993,11 @@ mod tests {
         assert!(content.contains("API_KEY"));
         assert!(content.contains("secret123"));
         assert!(content.contains("my-server"));
+        assert!(content.contains("pass_env"));
+        assert!(content.contains("PATH"));
+        assert!(content.contains("HOME"));
+        assert!(content.contains("log_stdout"));
+        assert!(content.contains("true"));
     }
 
     #[test]
@@ -2947,6 +3006,7 @@ mod tests {
         let server = acp::McpServer::Http(
             acp::McpServerHttp::new("api-server", "https://api.example.com/mcp").headers(vec![
                 acp::HttpHeader::new("Authorization", "Bearer token123"),
+                acp::HttpHeader::new("X-Custom-Header", "custom-value"),
             ]),
         );
         let config_dir =
@@ -2955,26 +3015,35 @@ mod tests {
 
         assert!(content.contains("transport: http"));
         assert!(content.contains("url: https://api.example.com/mcp"));
-        assert!(content.contains("Authorization"));
-        assert!(content.contains("Bearer token123"));
         assert!(content.contains("api-server"));
+
+        // Authorization header should be mapped to the auth field, not headers
+        assert!(content.contains("auth"));
+        assert!(content.contains("authorization-header"));
+        assert!(content.contains("Bearer token123"));
+
+        // Non-auth header stays in headers
+        assert!(content.contains("headers"));
+        assert!(content.contains("X-Custom-Header"));
+        assert!(content.contains("custom-value"));
     }
 
     #[test]
-    fn test_write_mcp_servers_config_sse_treated_as_http() {
+    fn test_write_mcp_servers_config_sse_skipped() {
         let temp = tempfile::tempdir().unwrap();
         let server = acp::McpServer::Sse(acp::McpServerSse::new(
             "sse-server",
             "https://sse.example.com/events",
         ));
-        let config_dir =
-            write_mcp_servers_config(&[server], temp.path()).expect("should return a config dir");
-        let content = std::fs::read_to_string(config_dir.join("config.yaml")).unwrap();
-
-        // SSE is mapped to http transport since polytoken doesn't have a separate SSE transport
-        assert!(content.contains("transport: http"));
-        assert!(content.contains("url: https://sse.example.com/events"));
-        assert!(content.contains("sse-server"));
+        // SSE is not supported by polytoken, so it should be skipped.
+        // The config is still written but the SSE server won't appear in it.
+        let result = write_mcp_servers_config(&[server], temp.path());
+        if let Some(config_dir) = result {
+            let content = std::fs::read_to_string(config_dir.join("config.yaml")).unwrap();
+            // SSE server name should NOT appear since we skipped it
+            assert!(!content.contains("sse-server"));
+            assert!(!content.contains("transport: http"));
+        }
     }
 
     #[test]
