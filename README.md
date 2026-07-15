@@ -16,13 +16,18 @@ Paseo  ──stdio JSON-RPC──>  polytoken-acp (Rust binary, ACP Agent)
                                └── POST /turn/cancel ← ACP session/cancel
 ```
 
-## Building
+## Building & Installing
 
 ```bash
-cargo build --release
+cargo build --release          # build to target/release/polytoken-acp
+cargo install --path . --force # install to ~/.cargo/bin/polytoken-acp
 ```
 
-The binary will be at `target/release/polytoken-acp`.
+`cargo build` only writes to `target/release/`. The ACP client (e.g. Paseo) spawns the **installed** binary — typically `~/.cargo/bin/polytoken-acp` or a symlink to it — so you must run `cargo install --path . --force` after pulling changes or you'll keep running the old binary. Starting a new session is not enough; the client re-spawns the same stale shim each time.
+
+### macOS: do not `cp` to install
+
+On macOS, copying the release binary directly with `cp` (e.g. `cp target/release/polytoken-acp ~/.cargo/bin/`) results in a process that is immediately killed (exit code 137 / SIGKILL). This is caused by the `com.apple.provenance` extended attribute that macOS attaches to manually-copied binaries. Use `cargo install --path . --force` instead, which handles code signing correctly.
 
 ### Prerequisites
 
@@ -75,7 +80,8 @@ Then launch Paseo, select "Polytoken" as the provider, and start a session.
 | `interrogative` (clarification, plan_handoff) | `session/request_permission` → `POST /interrogative/{id}/respond` (best-effort; cancelled if unsupported) |
 | `ask_user_question` | `ext_method` (`polytoken/ask_user_question`) → `POST /interrogative/{id}/respond` |
 | `session_title_changed` | `session/update` → `session_info_update` (title) |
-| `facet_changed` | `session/update` → `current_mode_update` |
+| `facet_changed` | Ignored (facets are slash commands, not ACP modes; mode maps to the permission monitor) |
+| `permission_monitor_switched` | `session/update` → `current_mode_update` |
 | `model_changed` | Ignored (model config option already tracks state from `/state`) |
 | `message_complete` | `session/prompt` response with `stop_reason: end_turn` |
 | `turn_cancelled` | `session/prompt` response with `stop_reason: cancelled` |
@@ -159,6 +165,16 @@ Each ACP session spawns a `polytoken daemon` process. If the daemon fails to sta
 1. Check that `polytoken` is on `PATH` and `polytoken --version` works.
 2. Check the shim's stderr output for error messages.
 3. The daemon's temp directory is under `$TMPDIR/polytoken-acp-{session_id}/` — check `logs/` for daemon logs.
+
+### Still seeing old modes (e.g. plan/execute) after pulling changes
+
+The ACP client spawns the **installed** binary, not `target/release/`. If you only ran `cargo build`, the installed shim at `~/.cargo/bin/polytoken-acp` (or wherever the client resolves it on `PATH`) is still the old one. Reinstall:
+
+```bash
+cargo install --path . --force
+```
+
+Then fully quit and relaunch the ACP client (don't just open a new session tab) so it re-spawns the updated shim.
 
 ### stdout pollution
 
