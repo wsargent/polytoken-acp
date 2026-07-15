@@ -238,8 +238,18 @@ async fn handle_new_session(
 
             // Fetch daemon state once, then build modes and config options from it.
             let daemon_state = daemon.fetch_daemon_state().await;
-            let mode_state = build_session_mode_state_from_value(&daemon_state);
-            let config_options = build_config_options(&daemon_state, &mode_state);
+            let permission_monitor = match fetch_permission_monitor_raw(
+                daemon.base_url(),
+                daemon.bearer_token(),
+            )
+            .await
+            {
+                Some(v) => Ok(v),
+                None => Err(anyhow::anyhow!("permission-monitor fetch failed")),
+            };
+            let mode_state = build_session_mode_from_permission_monitor(&permission_monitor);
+            let config_options =
+                build_config_options(&daemon_state, &mode_state, &permission_monitor);
 
             state
                 .lock()
@@ -359,8 +369,18 @@ async fn handle_resume_session(
     match DaemonHandle::spawn_with_session_id(&req.cwd, Some(&session_id)).await {
         Ok(daemon) => {
             let daemon_state = daemon.fetch_daemon_state().await;
-            let mode_state = build_session_mode_state_from_value(&daemon_state);
-            let config_options = build_config_options(&daemon_state, &mode_state);
+            let permission_monitor = match fetch_permission_monitor_raw(
+                daemon.base_url(),
+                daemon.bearer_token(),
+            )
+            .await
+            {
+                Some(v) => Ok(v),
+                None => Err(anyhow::anyhow!("permission-monitor fetch failed")),
+            };
+            let mode_state = build_session_mode_from_permission_monitor(&permission_monitor);
+            let config_options =
+                build_config_options(&daemon_state, &mode_state, &permission_monitor);
 
             state
                 .lock()
@@ -531,8 +551,18 @@ async fn handle_load_session(
     match DaemonHandle::spawn_with_session_id(&req.cwd, Some(&session_id)).await {
         Ok(daemon) => {
             let daemon_state = daemon.fetch_daemon_state().await;
-            let mode_state = build_session_mode_state_from_value(&daemon_state);
-            let config_options = build_config_options(&daemon_state, &mode_state);
+            let permission_monitor = match fetch_permission_monitor_raw(
+                daemon.base_url(),
+                daemon.bearer_token(),
+            )
+            .await
+            {
+                Some(v) => Ok(v),
+                None => Err(anyhow::anyhow!("permission-monitor fetch failed")),
+            };
+            let mode_state = build_session_mode_from_permission_monitor(&permission_monitor);
+            let config_options =
+                build_config_options(&daemon_state, &mode_state, &permission_monitor);
 
             // Fetch and replay history BEFORE inserting the daemon into the
             // state map. This avoids a re-lock after insertion and matches
@@ -783,31 +813,49 @@ async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotifi
         .await;
 }
 
-/// Build the ACP SessionModeState from the daemon's current facet and known facets.
-/// Polytoken has two facets: "execute" (default) and "plan".
-fn build_session_mode_state_from_value(
-    state: &Result<serde_json::Value, anyhow::Error>,
+/// Build the ACP SessionModeState from the daemon's permission monitor state.
+///
+/// The daemon exposes 4 permission monitor modes: standard, bypass,
+/// bypass_plus, autonomous. ACP "mode" maps to the permission monitor,
+/// matching how other ACP providers (e.g. Claude Code) expose permission
+/// tiers as modes.
+fn build_session_mode_from_permission_monitor(
+    permission_monitor: &Result<serde_json::Value, anyhow::Error>,
 ) -> Option<acp::SessionModeState> {
-    let active_facet = match state {
-        Ok(state) => state
-            .get("active_facet")
-            .and_then(|v| v.as_str())
-            .unwrap_or("execute")
-            .to_string(),
+    let pm = match permission_monitor {
+        Ok(v) => v,
         Err(e) => {
-            warn!(error = %e, "Failed to fetch daemon state for modes; defaulting to execute");
-            "execute".to_string()
+            warn!(error = %e, "Failed to fetch /permission-monitor for modes; defaulting to standard");
+            return Some(acp::SessionModeState::new(
+                "standard",
+                permission_monitor_modes(),
+            ));
         }
     };
 
-    let modes = vec![
-        acp::SessionMode::new("execute", "Execute")
-            .description("Agent executes tasks, writes files, and runs commands"),
-        acp::SessionMode::new("plan", "Plan")
-            .description("Agent plans and reviews before making changes"),
-    ];
+    let current = pm
+        .get("monitor")
+        .and_then(|m| m.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("standard")
+        .to_string();
 
-    Some(acp::SessionModeState::new(active_facet, modes))
+    Some(acp::SessionModeState::new(
+        current,
+        permission_monitor_modes(),
+    ))
+}
+
+/// The four permission monitor modes advertised as ACP SessionModes.
+fn permission_monitor_modes() -> Vec<acp::SessionMode> {
+    vec![
+        acp::SessionMode::new("standard", "Standard")
+            .description("Default permission prompts for tool calls"),
+        acp::SessionMode::new("bypass", "Bypass").description("Skip permission prompts"),
+        acp::SessionMode::new("bypass_plus", "Bypass+").description("Enhanced bypass mode"),
+        acp::SessionMode::new("autonomous", "Autonomous")
+            .description("Autonomous classifier-based permissions"),
+    ]
 }
 
 /// Build the model `SessionConfigOption` from the daemon's `available_models` list.
@@ -818,28 +866,10 @@ fn build_session_mode_state_from_value(
 /// display label (`AvailableModelEntry.label`).
 fn build_config_options(
     state: &Result<serde_json::Value, anyhow::Error>,
-    mode_state: &Option<acp::SessionModeState>,
+    _mode_state: &Option<acp::SessionModeState>,
+    _permission_monitor: &Result<serde_json::Value, anyhow::Error>,
 ) -> Vec<acp::SessionConfigOption> {
     let mut options = Vec::new();
-
-    // Mode config option (category=mode)
-    if let Some(ms) = mode_state {
-        let mode_options: Vec<acp::SessionConfigSelectOption> = ms
-            .available_modes
-            .iter()
-            .map(|m| {
-                acp::SessionConfigSelectOption::new(m.id.0.as_ref().to_string(), m.name.clone())
-            })
-            .collect();
-
-        if !mode_options.is_empty() {
-            let current_mode = ms.current_mode_id.0.as_ref().to_string();
-            let mode_option =
-                acp::SessionConfigOption::select("mode", "Mode", current_mode, mode_options)
-                    .category(acp::SessionConfigOptionCategory::Mode);
-            options.push(mode_option);
-        }
-    }
 
     // Model config option (category=model)
     if let Some(opt) = build_model_config_option(state) {
@@ -869,6 +899,7 @@ fn build_available_commands() -> Option<Vec<acp::AvailableCommand>> {
         "/clear",
         "/compact",
         "/daemon-reload",
+        "/facet",
         "/goal",
         "/reset-shell",
         "/title",
@@ -1224,32 +1255,32 @@ async fn handle_set_session_mode(
 
     let (base_url, bearer) = result;
     let client = reqwest::Client::new();
-    let url = format!("{}/facet", base_url);
+    let url = format!("{}/permission-monitor", base_url);
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", bearer))
-        .json(&serde_json::json!({ "facet": mode_id }))
+        .json(&serde_json::json!({ "mode": mode_id }))
         .send()
         .await;
     let result = match resp {
         Ok(r) if r.status().is_success() => Ok(()),
         Ok(r) => Err(anyhow::anyhow!(
-            "POST /facet returned status {}",
+            "POST /permission-monitor returned status {}",
             r.status()
         )),
-        Err(e) => Err(anyhow::anyhow!("Failed to POST /facet: {}", e)),
+        Err(e) => Err(anyhow::anyhow!("Failed to POST /permission-monitor: {}", e)),
     };
 
     match result {
         Ok(()) => {
-            info!(session_id = %session_id, mode_id = %mode_id, "Facet switched");
+            info!(session_id = %session_id, mode_id = %mode_id, "Permission monitor mode switched");
             responder.respond(acp::SetSessionModeResponse::new())
         }
         Err(e) => {
-            error!(error = %e, "Failed to switch facet");
+            error!(error = %e, "Failed to switch permission monitor mode");
             responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
                 serde_json::json!({
-                    "error": "Failed to switch facet",
+                    "error": "Failed to switch permission monitor mode",
                     "detail": e.to_string(),
                 }),
             ))
@@ -1302,11 +1333,6 @@ async fn handle_set_session_config_option(
             format!("{}/model", base_url),
             serde_json::json!({ "model": value }),
             "model",
-        ),
-        "mode" => (
-            format!("{}/facet", base_url),
-            serde_json::json!({ "facet": value }),
-            "facet/mode",
         ),
         mcp_id if mcp_id.starts_with("mcp:") => {
             let server_name = &mcp_id[4..];
@@ -1830,6 +1856,21 @@ async fn process_sse_event(
             }
             ConsumeOutcome::Continue
         }
+        EventTranslation::PermissionMonitorSwitch { mode } => {
+            debug!(mode = %mode, "Permission monitor switched; sending CurrentModeUpdate");
+            // Permissions are now mapped to ACP "mode", so a permission
+            // monitor switch is forwarded as a CurrentModeUpdate.
+            let mode_update = acp::CurrentModeUpdate::new(mode.clone());
+            let sid = acp::SessionId::new(session_id.to_string());
+            let notification = acp::SessionNotification::new(
+                sid,
+                acp::SessionUpdate::CurrentModeUpdate(mode_update),
+            );
+            if let Err(e) = conn.send_notification(notification) {
+                error!(error = %e, "Failed to send CurrentModeUpdate for permission monitor switch");
+            }
+            ConsumeOutcome::Continue
+        }
         EventTranslation::Ignore => ConsumeOutcome::Continue,
     }
 }
@@ -2109,6 +2150,26 @@ async fn fetch_daemon_state_raw(base_url: &str, bearer_token: &str) -> Option<se
         .ok()?;
     if !resp.status().is_success() {
         warn!(status = %resp.status(), "Failed to fetch /state for todo plan");
+        return None;
+    }
+    resp.json::<serde_json::Value>().await.ok()
+}
+
+/// Fetch the daemon's `/permission-monitor` as raw JSON.
+async fn fetch_permission_monitor_raw(
+    base_url: &str,
+    bearer_token: &str,
+) -> Option<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/permission-monitor", base_url);
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "Failed to fetch /permission-monitor");
         return None;
     }
     resp.json::<serde_json::Value>().await.ok()
@@ -2576,5 +2637,36 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_build_session_mode_from_permission_monitor() {
+        let pm = serde_json::json!({
+            "monitor": {"type": "bypass"},
+            "config_default": {"type": "standard"}
+        });
+        let pm_result: Result<serde_json::Value, anyhow::Error> = Ok(pm);
+
+        let ms = build_session_mode_from_permission_monitor(&pm_result)
+            .expect("should return Some for valid permission monitor response");
+
+        assert_eq!(ms.current_mode_id.0.as_ref(), "bypass");
+        assert_eq!(ms.available_modes.len(), 4);
+
+        let ids: Vec<&str> = ms.available_modes.iter().map(|m| m.id.0.as_ref()).collect();
+        assert!(ids.contains(&"standard"));
+        assert!(ids.contains(&"bypass"));
+        assert!(ids.contains(&"bypass_plus"));
+        assert!(ids.contains(&"autonomous"));
+    }
+
+    #[test]
+    fn test_build_session_mode_from_permission_monitor_error() {
+        let pm_result: Result<serde_json::Value, anyhow::Error> =
+            Err(anyhow::anyhow!("permission-monitor fetch failed"));
+
+        let ms = build_session_mode_from_permission_monitor(&pm_result)
+            .expect("should still return Some with default on error");
+        assert_eq!(ms.current_mode_id.0.as_ref(), "standard");
     }
 }

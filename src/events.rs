@@ -174,6 +174,11 @@ pub enum DaemonEvent {
     },
     #[serde(rename = "heartbeat")]
     Heartbeat,
+    #[serde(rename = "permission_monitor_switch")]
+    PermissionMonitorSwitch {
+        to_monitor: PermissionMonitorSummary,
+        from_monitor: PermissionMonitorSummary,
+    },
     #[serde(other)]
     Other,
 }
@@ -198,6 +203,16 @@ pub enum BlockDeltaPayload {
     OpenAiReasoning { id: String, data: String },
     #[serde(other)]
     Other,
+}
+
+/// Minimal extraction of the permission monitor `type` discriminator.
+/// The full PermissionMonitor tagged union has additional variant-specific
+/// fields (classifier_model, classifier_rules, max_consecutive_denials for
+/// autonomous), but we only need the mode string for config option updates.
+#[derive(Deserialize, Debug, Clone)]
+pub struct PermissionMonitorSummary {
+    #[serde(rename = "type")]
+    pub kind: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +332,8 @@ pub enum EventTranslation {
     GoalDriverUpdate { transition: String, summary: String },
     /// Re-fetch /state for todo/plan updates.
     TodoStateChange,
+    /// Permission monitor mode changed externally — re-fetch and send ConfigOptionUpdate.
+    PermissionMonitorSwitch { mode: String },
     /// Nothing to send (heartbeat, unknown, etc.)
     Ignore,
 }
@@ -351,6 +368,7 @@ pub fn event_type_name(evt: &DaemonEvent) -> &'static str {
         DaemonEvent::SystemReminder { .. } => "system_reminder",
         DaemonEvent::UsageThrottle { .. } => "usage_throttle",
         DaemonEvent::Heartbeat => "heartbeat",
+        DaemonEvent::PermissionMonitorSwitch { .. } => "permission_monitor_switch",
         DaemonEvent::Other => "unknown",
     }
 }
@@ -546,6 +564,9 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
         }
         DaemonEvent::UsageThrottle { provider, .. } => format!("provider={}", provider),
         DaemonEvent::Heartbeat => String::new(),
+        DaemonEvent::PermissionMonitorSwitch { to_monitor, .. } => {
+            format!("mode={}", to_monitor.kind)
+        }
         DaemonEvent::Other => String::new(),
     }
 }
@@ -764,11 +785,13 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             EventTranslation::Update(acp::SessionUpdate::SessionInfoUpdate(info_update))
         }
 
-        // Facet changed → forward as current_mode_update
+        // Facet changed → no longer forwarded as current_mode_update.
+        // Mode now maps to the permission monitor, not facets. Facet
+        // switching is handled via the /facet slash command. We log it
+        // but don't emit an ACP notification.
         DaemonEvent::FacetChanged { facet } => {
-            debug!(facet = %facet, "Facet changed; forwarding as current_mode_update");
-            let mode_update = acp::CurrentModeUpdate::new(facet.clone());
-            EventTranslation::Update(acp::SessionUpdate::CurrentModeUpdate(mode_update))
+            debug!(facet = %facet, "Facet changed; not forwarding (mode = permissions)");
+            EventTranslation::Ignore
         }
 
         // Subagent started → emit as ToolCall + extension notification
@@ -882,6 +905,14 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             EventTranslation::Ignore
         }
 
+        // Permission monitor switched → re-fetch and send ConfigOptionUpdate
+        DaemonEvent::PermissionMonitorSwitch { to_monitor, .. } => {
+            debug!(mode = %to_monitor.kind, "Permission monitor switched");
+            EventTranslation::PermissionMonitorSwitch {
+                mode: to_monitor.kind.clone(),
+            }
+        }
+
         _ => EventTranslation::Ignore,
     }
 }
@@ -954,8 +985,8 @@ pub(crate) fn tool_kind_for_name(name: &str) -> acp::ToolKind {
             acp::ToolKind::Think
         }
 
-        // Mode switching
-        "switch_facet" => acp::ToolKind::SwitchMode,
+        // Facet switching (no longer SwitchMode — mode = permissions now)
+        "switch_facet" => acp::ToolKind::Other,
 
         // Tool search / interaction / delegation
         "tool_search" | "ask_user_question" | "subagent" | "skill" | "flag_important" => {
@@ -1705,14 +1736,14 @@ mod tests {
 
     #[test]
     fn test_translate_facet_changed() {
+        // Facet changes are no longer forwarded as CurrentModeUpdate.
+        // Mode now maps to the permission monitor, not facets.
         let evt = DaemonEvent::FacetChanged {
             facet: "plan".into(),
         };
         match translate_event(&evt) {
-            EventTranslation::Update(acp::SessionUpdate::CurrentModeUpdate(u)) => {
-                assert_eq!(u.current_mode_id.0.as_ref(), "plan");
-            }
-            _ => panic!("Expected CurrentModeUpdate"),
+            EventTranslation::Ignore => {}
+            _ => panic!("Expected Ignore for FacetChanged"),
         }
     }
 
@@ -1849,7 +1880,9 @@ mod tests {
         };
         match translate_event(&evt) {
             EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
-                assert_eq!(tc.kind, acp::ToolKind::SwitchMode);
+                // switch_facet is no longer SwitchMode — mode now maps to
+                // the permission monitor. Facet switching is a slash command.
+                assert_eq!(tc.kind, acp::ToolKind::Other);
             }
             _ => panic!("Expected ToolCall"),
         }
@@ -2229,6 +2262,61 @@ mod tests {
         match translate_event(&evt) {
             EventTranslation::Ignore => {}
             _ => panic!("Expected Ignore for non-todos domain"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_permission_monitor_switch() {
+        let json = r#"{
+            "type": "permission_monitor_switch",
+            "from_monitor": {"type": "standard"},
+            "to_monitor": {"type": "bypass"}
+        }"#;
+        let evt: DaemonEvent = serde_json::from_str(json).expect("Failed to deserialize");
+        match evt {
+            DaemonEvent::PermissionMonitorSwitch {
+                to_monitor,
+                from_monitor,
+            } => {
+                assert_eq!(to_monitor.kind, "bypass");
+                assert_eq!(from_monitor.kind, "standard");
+            }
+            _ => panic!("Expected PermissionMonitorSwitch"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_permission_monitor_switch_autonomous() {
+        // The autonomous variant has extra fields that should be ignored.
+        let json = r#"{
+            "type": "permission_monitor_switch",
+            "from_monitor": {"type": "standard"},
+            "to_monitor": {"type": "autonomous", "classifier_model": null, "classifier_rules": null, "max_consecutive_denials": 3}
+        }"#;
+        let evt: DaemonEvent = serde_json::from_str(json).expect("Failed to deserialize");
+        match evt {
+            DaemonEvent::PermissionMonitorSwitch { to_monitor, .. } => {
+                assert_eq!(to_monitor.kind, "autonomous");
+            }
+            _ => panic!("Expected PermissionMonitorSwitch"),
+        }
+    }
+
+    #[test]
+    fn test_translate_permission_monitor_switch() {
+        let evt = DaemonEvent::PermissionMonitorSwitch {
+            to_monitor: PermissionMonitorSummary {
+                kind: "autonomous".into(),
+            },
+            from_monitor: PermissionMonitorSummary {
+                kind: "standard".into(),
+            },
+        };
+        match translate_event(&evt) {
+            EventTranslation::PermissionMonitorSwitch { mode } => {
+                assert_eq!(mode, "autonomous");
+            }
+            _ => panic!("Expected PermissionMonitorSwitch translation"),
         }
     }
 }

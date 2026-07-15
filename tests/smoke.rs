@@ -244,7 +244,7 @@ fn polytoken_available() -> bool {
 ///
 /// Verifies that:
 /// - session/new returns a session_id
-/// - the response includes modes (execute, plan)
+/// - the response includes modes (standard, bypass, bypass_plus, autonomous)
 /// - the response includes config_options with a model select containing
 ///   at least one option
 ///
@@ -298,12 +298,16 @@ async fn test_session_new() {
         .as_array()
         .expect("availableModes should be an array");
     assert!(
-        available_modes.iter().any(|m| m["id"] == "execute"),
-        "modes should include execute"
+        available_modes.iter().any(|m| m["id"] == "standard"),
+        "modes should include standard"
     );
     assert!(
-        available_modes.iter().any(|m| m["id"] == "plan"),
-        "modes should include plan"
+        available_modes.iter().any(|m| m["id"] == "bypass"),
+        "modes should include bypass"
+    );
+    assert!(
+        available_modes.iter().any(|m| m["id"] == "autonomous"),
+        "modes should include autonomous"
     );
 
     // Config options
@@ -704,6 +708,61 @@ async fn test_session_close() {
     client.kill().await;
 }
 
+/// session/set_session_mode with a permission mode should switch the monitor.
+///
+/// Flow: initialize → authenticate → session/new → set_session_mode("bypass")
+///
+/// Run with: cargo test --test smoke -- --ignored test_set_permissions_mode
+#[tokio::test]
+#[ignore = "Requires polytoken binary + LLM credentials"]
+async fn test_set_permissions_mode() {
+    if !polytoken_available() {
+        eprintln!("SKIP: polytoken binary not on PATH");
+        return;
+    }
+
+    let mut client = AcpClient::spawn()
+        .await
+        .expect("failed to spawn polytoken-acp");
+    let cwd = std::env::current_dir().unwrap();
+
+    // Initialize + authenticate
+    client
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
+        .await;
+    client
+        .request("authenticate", json!({"methodId": "noop"}))
+        .await;
+
+    // Create a session
+    let result = client
+        .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await;
+    let session_id = result["sessionId"]
+        .as_str()
+        .expect("missing sessionId")
+        .to_string();
+
+    // Set permissions to bypass via set_session_mode
+    let _result = client
+        .request(
+            "session/set_session_mode",
+            json!({
+                "sessionId": &session_id,
+                "modeId": "bypass",
+            }),
+        )
+        .await;
+
+    // If we get here without panic, the mode was accepted.
+    eprintln!("session/set_session_mode accepted mode=bypass");
+
+    client.kill().await;
+}
+
 /// session/load on a known session ID should return modes, config_options,
 /// and replay history as session notifications.
 ///
@@ -781,8 +840,8 @@ async fn test_session_load() {
             .as_array()
             .expect("availableModes should be an array");
         assert!(
-            available_modes.iter().any(|m| m["id"] == "execute"),
-            "modes should include execute"
+            available_modes.iter().any(|m| m["id"] == "standard"),
+            "modes should include standard"
         );
         eprintln!("session/load returned {} modes", available_modes.len());
     }
