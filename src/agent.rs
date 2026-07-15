@@ -995,6 +995,7 @@ fn build_available_commands() -> Option<Vec<acp::AvailableCommand>> {
         "/daemon-reload",
         "/facet",
         "/goal",
+        "/mcp",
         "/reset-shell",
         "/title",
     ];
