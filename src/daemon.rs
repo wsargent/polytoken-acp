@@ -119,6 +119,21 @@ impl DaemonHandle {
                 .context("Failed to set credential file permissions")?;
         }
 
+        // Remove any stale startup.json from a previous daemon run. Without this,
+        // poll_startup would read the old file (state: "ready", old port) on its
+        // very first iteration and return the old port — before the new daemon
+        // has had a chance to overwrite it. This happens when polytoken-acp
+        // restarts (e.g. Paseo bounce) and resumes a session whose daemon was
+        // killed or orphaned, leaving a stale startup.json behind.
+        let startup_path = sessions_dir.join(&session_id).join("startup.json");
+        if startup_path.exists() {
+            if let Err(e) = std::fs::remove_file(&startup_path) {
+                warn!(path = ?startup_path, error = %e, "Failed to remove stale startup.json");
+            } else {
+                debug!(path = ?startup_path, "Removed stale startup.json");
+            }
+        }
+
         info!(session_id = %session_id, cwd = ?cwd, "Spawning polytoken daemon");
 
         let mut cmd = Command::new("polytoken");
@@ -181,7 +196,6 @@ impl DaemonHandle {
         }
 
         // Poll startup.json until state == "ready"
-        let startup_path = sessions_dir.join(&session_id).join("startup.json");
         let timeout_result =
             tokio::time::timeout(STARTUP_TIMEOUT, poll_startup(&startup_path)).await;
 

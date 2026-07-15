@@ -13,10 +13,12 @@ use agent_client_protocol::{
     Agent, Client, ConnectionTo, Dispatch, Stdio, on_receive_dispatch, on_receive_notification,
     on_receive_request,
 };
+use anyhow::{Context, bail};
 use tracing::{debug, error, info, warn};
 
 use crate::daemon::DaemonHandle;
 use crate::events::{self, AskUserQuestionPayload, EventTranslation};
+use crate::history;
 
 /// Shared state across all ACP handlers for one connection.
 struct AgentState {
@@ -67,7 +69,7 @@ pub async fn run() {
                     }),
                 );
                 let caps = acp::AgentCapabilities::new()
-                    .load_session(false)
+                    .load_session(true)
                     .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
                     .mcp_capabilities(acp::McpCapabilities::new())
                     .session_capabilities(
@@ -110,6 +112,16 @@ pub async fn run() {
                 let state = Arc::clone(&state);
                 async move |req: acp::ResumeSessionRequest, responder, cx| {
                     handle_resume_session(&state, req, responder, cx).await
+                }
+            },
+            on_receive_request!(),
+        )
+        // session/load
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::LoadSessionRequest, responder, cx| {
+                    handle_load_session(&state, req, responder, cx).await
                 }
             },
             on_receive_request!(),
@@ -309,7 +321,7 @@ async fn handle_resume_session(
     state: &Arc<Mutex<AgentState>>,
     req: acp::ResumeSessionRequest,
     responder: agent_client_protocol::Responder<acp::ResumeSessionResponse>,
-    _cx: ConnectionTo<Client>,
+    cx: ConnectionTo<Client>,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = req.session_id.0.to_string();
 
@@ -343,6 +355,57 @@ async fn handle_resume_session(
                 .sessions
                 .insert(session_id.clone(), daemon);
 
+            // Push session state to the client so resumed sessions behave like
+            // new sessions — without these notifications the client sees a blank
+            // slate even though the daemon loaded saved history.
+
+            // Send session_info_update with the title from the daemon state.
+            if let Ok(ref ds) = daemon_state
+                && let Some(title) = ds.get("session_title").and_then(|v| v.as_str())
+                && !title.is_empty()
+            {
+                let info_update = acp::SessionInfoUpdate::new().title(title.to_string());
+                let sid = acp::SessionId::new(session_id.clone());
+                let notification = acp::SessionNotification::new(
+                    sid,
+                    acp::SessionUpdate::SessionInfoUpdate(info_update),
+                );
+                if let Err(e) = cx.send_notification(notification) {
+                    warn!(error = %e, "Failed to send session_info_update notification");
+                }
+            }
+
+            // Send available_commands_update with the daemon's slash commands and skills.
+            {
+                let mut all_commands = build_available_commands().unwrap_or_default();
+                let skill_commands = build_skill_commands(&daemon_state);
+                all_commands.extend(skill_commands);
+                if !all_commands.is_empty() {
+                    let sid = acp::SessionId::new(session_id.clone());
+                    let notification = acp::SessionNotification::new(
+                        sid,
+                        acp::SessionUpdate::AvailableCommandsUpdate(
+                            acp::AvailableCommandsUpdate::new(all_commands),
+                        ),
+                    );
+                    if let Err(e) = cx.send_notification(notification) {
+                        warn!(error = %e, "Failed to send available_commands_update notification");
+                    }
+                }
+            }
+
+            // Send initial Plan (todos) from daemon state.
+            if let Ok(ref ds) = daemon_state
+                && let Some(plan) = events::build_plan_from_state(ds)
+            {
+                let sid = acp::SessionId::new(session_id.clone());
+                let notification =
+                    acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+                if let Err(e) = cx.send_notification(notification) {
+                    warn!(error = %e, "Failed to send initial Plan notification");
+                }
+            }
+
             info!(session_id = %session_id, "Session resumed");
             let mut response = acp::ResumeSessionResponse::new();
             if let Some(ms) = &mode_state {
@@ -358,6 +421,158 @@ async fn handle_resume_session(
             responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
                 serde_json::json!({
                     "error": "Failed to resume polytoken daemon session",
+                    "detail": e.to_string(),
+                }),
+            ))
+        }
+    }
+}
+
+/// Handle `session/load` — spawn a daemon with `--resume`, fetch and replay
+/// history from `GET /history` as ACP session notifications, then return
+/// modes and config_options in the `LoadSessionResponse`.
+///
+/// This handler mirrors `handle_resume_session` but additionally:
+/// 1. Fetches conversation history from the daemon's `/history` endpoint.
+/// 2. Translates each history item into ACP `SessionUpdate` notifications.
+/// 3. Sends those notifications to the client before responding.
+///
+/// Paseo (`acp-agent.ts:1400-1411`) calls `session/load` when
+/// `loadSession: true` is advertised, captures all notifications into
+/// `persistedHistory` during `replayingHistory`, then replays them via
+/// `streamHistory()` to populate the timeline.
+async fn handle_load_session(
+    state: &Arc<Mutex<AgentState>>,
+    req: acp::LoadSessionRequest,
+    responder: agent_client_protocol::Responder<acp::LoadSessionResponse>,
+    cx: ConnectionTo<Client>,
+) -> Result<(), agent_client_protocol::Error> {
+    let session_id = req.session_id.0.to_string();
+
+    info!(session_id = %session_id, cwd = ?req.cwd, "ACP session/load");
+
+    // Check if we already have this session in memory.
+    {
+        let sessions = state.lock().unwrap();
+        if sessions.sessions.contains_key(&session_id) {
+            return responder.respond_with_error(
+                agent_client_protocol::Error::internal_error().data(serde_json::json!({
+                    "error": "Session already exists"
+                })),
+            );
+        }
+    }
+
+    match DaemonHandle::spawn_with_session_id(&req.cwd, Some(&session_id)).await {
+        Ok(daemon) => {
+            let daemon_state = daemon.fetch_daemon_state().await;
+            let mode_state = build_session_mode_state_from_value(&daemon_state);
+            let config_options = build_config_options(&daemon_state, &mode_state);
+
+            // Fetch and replay history BEFORE inserting the daemon into the
+            // state map. This avoids a re-lock after insertion and matches
+            // the pre-insert pattern used by handle_new_session and
+            // handle_resume_session, which call fetch_daemon_state on the
+            // owned daemon before inserting it.
+            let (base_url, bearer_token) = (
+                daemon.base_url().to_string(),
+                daemon.bearer_token().to_string(),
+            );
+            match fetch_history_raw(&base_url, &bearer_token).await {
+                Ok(history_items) => {
+                    let notifications =
+                        history::translate_history_to_notifications(&history_items, &session_id);
+                    for notification in &notifications {
+                        if let Err(e) = cx.send_notification(notification.clone()) {
+                            warn!(error = %e, "Failed to send history notification");
+                        }
+                    }
+                    info!(
+                        session_id = %session_id,
+                        history_count = history_items.len(),
+                        sent_notifications = notifications.len(),
+                        "History replayed"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to fetch history; continuing without replay");
+                }
+            }
+
+            // Insert the daemon into the state map (after history fetch).
+            state
+                .lock()
+                .unwrap()
+                .sessions
+                .insert(session_id.clone(), daemon);
+
+            // Push session state to the client so loaded sessions behave like
+            // new/resumed sessions. These blocks are copied verbatim from
+            // handle_resume_session to avoid refactoring existing working
+            // handlers — a future cleanup can deduplicate into a helper.
+
+            // Send session_info_update with the title from the daemon state.
+            if let Ok(ref ds) = daemon_state
+                && let Some(title) = ds.get("session_title").and_then(|v| v.as_str())
+                && !title.is_empty()
+            {
+                let info_update = acp::SessionInfoUpdate::new().title(title.to_string());
+                let sid = acp::SessionId::new(session_id.clone());
+                let notification = acp::SessionNotification::new(
+                    sid,
+                    acp::SessionUpdate::SessionInfoUpdate(info_update),
+                );
+                if let Err(e) = cx.send_notification(notification) {
+                    warn!(error = %e, "Failed to send session_info_update notification");
+                }
+            }
+
+            // Send available_commands_update with the daemon's slash commands and skills.
+            {
+                let mut all_commands = build_available_commands().unwrap_or_default();
+                let skill_commands = build_skill_commands(&daemon_state);
+                all_commands.extend(skill_commands);
+                if !all_commands.is_empty() {
+                    let sid = acp::SessionId::new(session_id.clone());
+                    let notification = acp::SessionNotification::new(
+                        sid,
+                        acp::SessionUpdate::AvailableCommandsUpdate(
+                            acp::AvailableCommandsUpdate::new(all_commands),
+                        ),
+                    );
+                    if let Err(e) = cx.send_notification(notification) {
+                        warn!(error = %e, "Failed to send available_commands_update notification");
+                    }
+                }
+            }
+
+            // Send initial Plan (todos) from daemon state.
+            if let Ok(ref ds) = daemon_state
+                && let Some(plan) = events::build_plan_from_state(ds)
+            {
+                let sid = acp::SessionId::new(session_id.clone());
+                let notification =
+                    acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
+                if let Err(e) = cx.send_notification(notification) {
+                    warn!(error = %e, "Failed to send initial Plan notification");
+                }
+            }
+
+            info!(session_id = %session_id, "Session loaded");
+            let mut response = acp::LoadSessionResponse::new();
+            if let Some(ms) = &mode_state {
+                response = response.modes(ms.clone());
+            }
+            if !config_options.is_empty() {
+                response = response.config_options(config_options);
+            }
+            responder.respond(response)
+        }
+        Err(e) => {
+            error!(error = %e, session_id = %session_id, "Failed to load session");
+            responder.respond_with_error(agent_client_protocol::Error::internal_error().data(
+                serde_json::json!({
+                    "error": "Failed to load polytoken daemon session",
                     "detail": e.to_string(),
                 }),
             ))
@@ -1866,6 +2081,35 @@ async fn fetch_context_usage(base_url: &str, bearer_token: &str) -> Option<acp::
     }
 
     Some(acp::UsageUpdate::new(used, size))
+}
+
+/// Fetch session history from the daemon's `GET /history` endpoint.
+///
+/// Returns the `items` array from the `SessionHistorySnapshot` as a list of
+/// `serde_json::Value` entries. Each entry has a `type` discriminant that
+/// `history::translate_history_item` dispatches on.
+async fn fetch_history_raw(
+    base_url: &str,
+    bearer_token: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/history", base_url);
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .send()
+        .await
+        .context("Failed to GET /history")?;
+    if !resp.status().is_success() {
+        bail!("GET /history returned status {}", resp.status());
+    }
+    let snapshot: serde_json::Value = resp.json().await.context("Failed to parse /history")?;
+    let items = snapshot
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(items)
 }
 
 async fn respond_interrogative_permission(
