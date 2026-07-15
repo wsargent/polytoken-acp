@@ -1676,14 +1676,22 @@ async fn handle_set_session_config_option(
                         return responder.respond(acp::SetSessionConfigOptionResponse::new(vec![]));
                     }
 
+                    // The daemon encodes effort in the model name (e.g.
+                    // "zai/glm-5.2(high)"). When a variant is already active,
+                    // /state's active_model already includes the suffix, so
+                    // strip any existing "(…)" suffix before composing the new
+                    // variant to avoid doubling it (e.g.
+                    // "zai/glm-5.2(high)(medium)").
+                    let base_model = active_model.split('(').next().unwrap_or(active_model);
+
                     // For effort-type models: append (value) to model name
                     // For thinking-type models: "thinking" → use base model name (no suffix)
                     //                          "none" → append (none)
                     let model_with_effort = if value == "thinking" {
                         // Thinking on = the base model name (default)
-                        active_model.to_string()
+                        base_model.to_string()
                     } else {
-                        format!("{}({})", active_model, value)
+                        format!("{}({})", base_model, value)
                     };
 
                     // Verify this model variant exists in available_models
