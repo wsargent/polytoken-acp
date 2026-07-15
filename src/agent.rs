@@ -321,7 +321,7 @@ async fn handle_new_session(
 
             // Send available_commands_update with the daemon's slash commands and skills.
             {
-                let mut all_commands = build_available_commands().unwrap_or_default();
+                let mut all_commands = build_available_commands(&req.cwd).unwrap_or_default();
                 let skill_commands = build_skill_commands(&daemon_state);
                 all_commands.extend(skill_commands);
                 if !all_commands.is_empty() {
@@ -469,7 +469,7 @@ async fn handle_resume_session(
 
             // Send available_commands_update with the daemon's slash commands and skills.
             {
-                let mut all_commands = build_available_commands().unwrap_or_default();
+                let mut all_commands = build_available_commands(&req.cwd).unwrap_or_default();
                 let skill_commands = build_skill_commands(&daemon_state);
                 all_commands.extend(skill_commands);
                 if !all_commands.is_empty() {
@@ -529,7 +529,7 @@ async fn handle_resume_session(
 
             // Send available_commands_update with the daemon's slash commands and skills.
             {
-                let mut all_commands = build_available_commands().unwrap_or_default();
+                let mut all_commands = build_available_commands(&req.cwd).unwrap_or_default();
                 let skill_commands = build_skill_commands(&daemon_state);
                 all_commands.extend(skill_commands);
                 if !all_commands.is_empty() {
@@ -718,7 +718,7 @@ async fn handle_load_session(
 
             // Send available_commands_update with the daemon's slash commands and skills.
             {
-                let mut all_commands = build_available_commands().unwrap_or_default();
+                let mut all_commands = build_available_commands(&req.cwd).unwrap_or_default();
                 let skill_commands = build_skill_commands(&daemon_state);
                 all_commands.extend(skill_commands);
                 if !all_commands.is_empty() {
@@ -866,6 +866,7 @@ async fn handle_prompt(
         events_url,
         bearer_token,
         base_url,
+        cwd,
         responder,
     };
 
@@ -981,12 +982,84 @@ fn build_config_options(
     options
 }
 
+/// Scan a directory for `*.md` facet files and insert their names (filename
+/// minus `.md`) into the given map. Silently ignores non-existent or
+/// unreadable directories.
+fn scan_facets_dir(dir: &std::path::Path, facets: &mut std::collections::BTreeMap<String, ()>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "md") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            facets.insert(stem.to_string(), ());
+        }
+    }
+}
+
+/// Discover all available facets by combining three sources:
+///
+/// | Source | How |
+/// |---|---|
+/// | Shipped facets | `polytoken vfs ls polytoken://facets` |
+/// | Project facets | scan `<cwd>/.polytoken/facets/*.md` |
+/// | Global facets | scan `~/.config/polytoken/facets/*.md` |
+///
+/// The filename minus `.md` is the facet name. All three sources are unioned
+/// and deduplicated (custom facets override shipped facets of the same name).
+/// Returns a sorted `Vec<String>`.
+fn discover_facets(cwd: &std::path::Path) -> Vec<String> {
+    let mut facets = std::collections::BTreeMap::new();
+
+    // 1. Shipped facets from VFS.
+    if let Ok(output) = std::process::Command::new("polytoken")
+        .arg("vfs")
+        .arg("ls")
+        .arg("polytoken://facets")
+        .output()
+        && output.status.success()
+        && let Ok(text) = std::str::from_utf8(&output.stdout)
+    {
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(name) = line.strip_suffix(".md") {
+                facets.insert(name.to_string(), ());
+            }
+        }
+    }
+
+    // 2. Project facets from <cwd>/.polytoken/facets/*.md
+    scan_facets_dir(&cwd.join(".polytoken").join("facets"), &mut facets);
+
+    // 3. Global facets from ~/.config/polytoken/facets/*.md
+    if let Ok(home) = std::env::var("HOME") {
+        let global_dir = std::path::Path::new(&home)
+            .join(".config")
+            .join("polytoken")
+            .join("facets");
+        scan_facets_dir(&global_dir, &mut facets);
+    }
+
+    facets.into_keys().collect()
+}
+
 /// Build the ACP available commands list from `polytoken print-slash-commands`.
 ///
 /// Only commands that the daemon can actually execute when received as a
 /// prompt are advertised. TUI-only commands (help, refresh, quit, theme,
 /// etc.) are filtered out since they can't work over ACP.
-fn build_available_commands() -> Option<Vec<acp::AvailableCommand>> {
+///
+/// For the `/facet` command, `_meta.polytoken.choices` is populated with the
+/// list of available facet names discovered from the filesystem, so ACP
+/// clients (e.g. Paseo) can render autocomplete suggestions.
+fn build_available_commands(cwd: &std::path::Path) -> Option<Vec<acp::AvailableCommand>> {
     // Commands that make sense in an ACP context — the daemon can handle
     // these when they appear in a prompt. TUI-only commands are excluded.
     const ACP_SAFE_COMMANDS: &[&str] = &[
@@ -1038,6 +1111,21 @@ fn build_available_commands() -> Option<Vec<acp::AvailableCommand>> {
                     acp::UnstructuredCommandInput::new(hint),
                 ));
             }
+
+            // Attach facet choices to the /facet command so ACP clients can
+            // render autocomplete suggestions.
+            if canonical == "/facet" {
+                let choices = discover_facets(cwd);
+                if !choices.is_empty() {
+                    let mut meta = serde_json::Map::new();
+                    meta.insert(
+                        "polytoken".to_string(),
+                        serde_json::json!({ "choices": choices }),
+                    );
+                    acp_cmd = acp_cmd.meta(meta);
+                }
+            }
+
             Some(acp_cmd)
         })
         .collect();
@@ -1784,6 +1872,7 @@ struct SseConsumer {
     events_url: String,
     bearer_token: String,
     base_url: String,
+    cwd: std::path::PathBuf,
     responder: agent_client_protocol::Responder<acp::PromptResponse>,
 }
 
@@ -1798,6 +1887,7 @@ impl SseConsumer {
         let events_url = self.events_url;
         let bearer_token = self.bearer_token;
         let base_url = self.base_url;
+        let cwd = self.cwd;
         let mut responder = Some(self.responder);
 
         loop {
@@ -1807,6 +1897,7 @@ impl SseConsumer {
                 &base_url,
                 &prompt_id,
                 &session_id,
+                &cwd,
                 &conn,
             )
             .await
@@ -1875,6 +1966,7 @@ async fn connect_and_consume(
     base_url: &str,
     prompt_id: &str,
     session_id: &str,
+    cwd: &std::path::Path,
     conn: &ConnectionTo<Client>,
 ) -> ConsumeOutcome {
     let client = reqwest::Client::new();
@@ -1902,6 +1994,9 @@ async fn connect_and_consume(
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
     let mut parser = SseParser::new();
+    // Cache the last-known facet list so we only re-send available_commands_update
+    // when the list actually changes (guards against spurious session_state_changed).
+    let mut cached_facets: Option<Vec<String>> = None;
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = match chunk_result {
@@ -1914,8 +2009,17 @@ async fn connect_and_consume(
 
         let data_lines = parser.feed(&chunk);
         for data in data_lines {
-            match process_sse_event(&data, prompt_id, session_id, base_url, bearer_token, conn)
-                .await
+            match process_sse_event(
+                &data,
+                prompt_id,
+                session_id,
+                base_url,
+                bearer_token,
+                cwd,
+                &mut cached_facets,
+                conn,
+            )
+            .await
             {
                 ConsumeOutcome::Done(reason) => return ConsumeOutcome::Done(reason),
                 ConsumeOutcome::Error => return ConsumeOutcome::Error,
@@ -1930,12 +2034,15 @@ async fn connect_and_consume(
 }
 
 /// Process a single SSE event and translate it into ACP actions.
+#[allow(clippy::too_many_arguments)]
 async fn process_sse_event(
     data: &str,
     prompt_id: &str,
     session_id: &str,
     base_url: &str,
     bearer_token: &str,
+    cwd: &std::path::Path,
+    cached_facets: &mut Option<Vec<String>>,
     conn: &ConnectionTo<Client>,
 ) -> ConsumeOutcome {
     let event = match events::parse_sse_event(data) {
@@ -2158,6 +2265,35 @@ async fn process_sse_event(
                     acp::SessionNotification::new(sid, acp::SessionUpdate::Plan(plan));
                 if let Err(e) = conn.send_notification(notification) {
                     error!(error = %e, "Failed to send todo Plan notification");
+                }
+            }
+            ConsumeOutcome::Continue
+        }
+        EventTranslation::FacetChoicesCheck => {
+            // Re-discover facets and send updated available_commands_update
+            // only when the list has changed since the last check.
+            let new_facets = discover_facets(cwd);
+            if cached_facets.as_ref() != Some(&new_facets) {
+                debug!(facets = ?new_facets, "Facet list changed; sending available_commands_update");
+                *cached_facets = Some(new_facets.clone());
+                if let Some(mut all_commands) = build_available_commands(cwd) {
+                    // Also re-attach skill commands so the update is complete.
+                    let skill_commands = match fetch_daemon_state_raw(base_url, bearer_token).await
+                    {
+                        Some(state) => build_skill_commands(&Ok(state)),
+                        None => Vec::new(),
+                    };
+                    all_commands.extend(skill_commands);
+                    let sid = acp::SessionId::new(session_id.to_string());
+                    let notification = acp::SessionNotification::new(
+                        sid,
+                        acp::SessionUpdate::AvailableCommandsUpdate(
+                            acp::AvailableCommandsUpdate::new(all_commands),
+                        ),
+                    );
+                    if let Err(e) = conn.send_notification(notification) {
+                        warn!(error = %e, "Failed to send available_commands_update for facet change");
+                    }
                 }
             }
             ConsumeOutcome::Continue
@@ -3073,5 +3209,91 @@ mod tests {
         assert!(content.contains("remote"));
         assert!(content.contains("stdio"));
         assert!(content.contains("http"));
+    }
+
+    // ----- Facet discovery tests -----
+
+    #[test]
+    fn test_scan_facets_dir_finds_md_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let facets_dir = tmp.path().join("facets");
+        std::fs::create_dir_all(&facets_dir).unwrap();
+        std::fs::write(facets_dir.join("execute.md"), "# execute").unwrap();
+        std::fs::write(facets_dir.join("plan.md"), "# plan").unwrap();
+        std::fs::write(facets_dir.join("scribe.md"), "# scribe").unwrap();
+
+        let mut map = std::collections::BTreeMap::new();
+        scan_facets_dir(&facets_dir, &mut map);
+        assert_eq!(map.len(), 3);
+        assert!(map.contains_key("execute"));
+        assert!(map.contains_key("plan"));
+        assert!(map.contains_key("scribe"));
+    }
+
+    #[test]
+    fn test_scan_facets_dir_ignores_non_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let facets_dir = tmp.path().join("facets");
+        std::fs::create_dir_all(&facets_dir).unwrap();
+        std::fs::write(facets_dir.join("execute.md"), "# execute").unwrap();
+        std::fs::write(facets_dir.join("notes.txt"), "not a facet").unwrap();
+        std::fs::write(facets_dir.join("README"), "not a facet").unwrap();
+        std::fs::create_dir(facets_dir.join("subdir.md")).unwrap();
+
+        let mut map = std::collections::BTreeMap::new();
+        scan_facets_dir(&facets_dir, &mut map);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("execute"));
+    }
+
+    #[test]
+    fn test_scan_facets_dir_nonexistent() {
+        let mut map = std::collections::BTreeMap::new();
+        scan_facets_dir(std::path::Path::new("/nonexistent/path/facets"), &mut map);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_discover_facets_project_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_facets = tmp.path().join(".polytoken").join("facets");
+        std::fs::create_dir_all(&project_facets).unwrap();
+        std::fs::write(project_facets.join("scribe.md"), "# scribe").unwrap();
+        std::fs::write(project_facets.join("reviewer.md"), "# reviewer").unwrap();
+
+        let facets = discover_facets(tmp.path());
+        // Should include project facets; shipped facets (execute, plan) may or may
+        // not be present depending on whether `polytoken` is on PATH.
+        assert!(facets.contains(&"scribe".to_string()));
+        assert!(facets.contains(&"reviewer".to_string()));
+        // Result should be sorted.
+        assert_eq!(facets, {
+            let mut v = facets.clone();
+            v.sort();
+            v
+        });
+    }
+
+    #[test]
+    fn test_discover_facets_dedup() {
+        // Create a project facet with the same name as a shipped facet.
+        // The result should have no duplicates.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_facets = tmp.path().join(".polytoken").join("facets");
+        std::fs::create_dir_all(&project_facets).unwrap();
+        std::fs::write(project_facets.join("execute.md"), "# custom execute").unwrap();
+
+        let facets = discover_facets(tmp.path());
+        let execute_count = facets.iter().filter(|f| f.as_str() == "execute").count();
+        assert_eq!(execute_count, 1, "execute should appear at most once");
+    }
+
+    #[test]
+    fn test_discover_facets_empty_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let facets = discover_facets(tmp.path());
+        // May include shipped facets from VFS, but project dir is empty.
+        // The important invariant: no panics, valid output.
+        assert!(facets.iter().all(|f| !f.is_empty()));
     }
 }

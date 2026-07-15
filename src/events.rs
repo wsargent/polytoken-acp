@@ -332,6 +332,8 @@ pub enum EventTranslation {
     GoalDriverUpdate { transition: String, summary: String },
     /// Re-fetch /state for todo/plan updates.
     TodoStateChange,
+    /// Re-discover facets and send updated available_commands_update if changed.
+    FacetChoicesCheck,
     /// Permission monitor mode changed externally — re-fetch and send ConfigOptionUpdate.
     PermissionMonitorSwitch { mode: String },
     /// Nothing to send (heartbeat, unknown, etc.)
@@ -844,14 +846,16 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             subagent_handle,
         } => translate_job_event(job_id, "job_updated", subagent_handle, None),
 
-        // Session state changed → re-fetch /state for todo updates if domains include todos
+        // Session state changed → re-fetch /state for todo updates if domains
+        // include todos; otherwise check whether the facet list has changed
+        // (e.g. user added a facet file and ran /daemon-reload).
         DaemonEvent::SessionStateChanged { domains } => {
             if domains.iter().any(|d| d == "todos") {
                 debug!(domains = ?domains, "Session state changed (todos); will re-fetch /state");
                 EventTranslation::TodoStateChange
             } else {
-                debug!(domains = ?domains, "Session state changed (non-todos); ignoring");
-                EventTranslation::Ignore
+                debug!(domains = ?domains, "Session state changed (non-todos); will check facets");
+                EventTranslation::FacetChoicesCheck
             }
         }
         DaemonEvent::TodoStatusNudge => {
@@ -2260,8 +2264,8 @@ mod tests {
             domains: vec!["flags".into()],
         };
         match translate_event(&evt) {
-            EventTranslation::Ignore => {}
-            _ => panic!("Expected Ignore for non-todos domain"),
+            EventTranslation::FacetChoicesCheck => {}
+            _ => panic!("Expected FacetChoicesCheck for non-todos domain"),
         }
     }
 
