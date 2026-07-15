@@ -111,6 +111,8 @@ pub enum DaemonEvent {
     SubagentCompleted {
         handle: String,
         #[serde(default)]
+        outcome: Option<SubagentOutcome>,
+        #[serde(default)]
         result_summary: Option<String>,
     },
     #[serde(rename = "job_promoted")]
@@ -181,6 +183,27 @@ pub enum DaemonEvent {
     },
     #[serde(other)]
     Other,
+}
+
+/// Outcome kind reported by the daemon when a subagent finishes.
+///
+/// Corresponds to `SubagentResultKind` in the daemon's event schema.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentResultKind {
+    Success,
+    Failure,
+    Cancelled,
+}
+
+/// The `outcome` object on `subagent_completed` events.
+///
+/// Corresponds to `SubagentOutcome` in the daemon's event schema.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SubagentOutcome {
+    pub kind: SubagentResultKind,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// Delta payload for content_block_delta events.
@@ -310,6 +333,8 @@ pub enum EventTranslation {
     SubagentCompleted {
         handle: String,
         result_summary: Option<String>,
+        outcome_kind: Option<SubagentResultKind>,
+        outcome_message: Option<String>,
     },
     /// A job lifecycle event — emit extension notification (and ToolCall for shell jobs).
     /// Subagent jobs (subagent_handle is Some) are skipped to avoid duplicates with
@@ -505,10 +530,21 @@ pub fn event_summary(evt: &DaemonEvent) -> String {
         } => format!("handle={} type={} model={}", handle, subagent_type, model),
         DaemonEvent::SubagentCompleted {
             handle,
+            outcome,
             result_summary,
         } => {
             let summary = result_summary.as_deref().unwrap_or("(none)");
-            format!("handle={} summary={}", handle, summary)
+            let outcome_str = outcome.as_ref().map(|o| match o.kind {
+                SubagentResultKind::Success => "success",
+                SubagentResultKind::Failure => "failure",
+                SubagentResultKind::Cancelled => "cancelled",
+            });
+            format!(
+                "handle={} summary={} outcome={}",
+                handle,
+                summary,
+                outcome_str.unwrap_or("(none)")
+            )
         }
         DaemonEvent::JobPromoted {
             job_id,
@@ -813,12 +849,15 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
         // Subagent completed → emit as ToolCallUpdate + extension notification
         DaemonEvent::SubagentCompleted {
             handle,
+            outcome,
             result_summary,
         } => {
             debug!(handle = %handle, "Subagent completed");
             EventTranslation::SubagentCompleted {
                 handle: handle.clone(),
                 result_summary: result_summary.clone(),
+                outcome_kind: outcome.as_ref().map(|o| o.kind.clone()),
+                outcome_message: outcome.as_ref().and_then(|o| o.message.clone()),
             }
         }
 
@@ -1933,15 +1972,19 @@ mod tests {
 
     #[test]
     fn test_deserialize_subagent_completed() {
-        let json = r#"{"type":"subagent_completed","handle":"general-purpose:abc","result_summary":"Done"}"#;
+        let json = r#"{"type":"subagent_completed","handle":"general-purpose:abc","outcome":{"kind":"success","message":null},"result_summary":"Done"}"#;
         let evt: DaemonEvent = serde_json::from_str(json).unwrap();
         match evt {
             DaemonEvent::SubagentCompleted {
                 handle,
+                outcome,
                 result_summary,
             } => {
                 assert_eq!(handle, "general-purpose:abc");
                 assert_eq!(result_summary.as_deref(), Some("Done"));
+                let outcome = outcome.expect("outcome should be present");
+                assert_eq!(outcome.kind, SubagentResultKind::Success);
+                assert!(outcome.message.is_none());
             }
             _ => panic!("Expected SubagentCompleted"),
         }
@@ -1949,15 +1992,19 @@ mod tests {
 
     #[test]
     fn test_deserialize_subagent_completed_no_summary() {
-        let json = r#"{"type":"subagent_completed","handle":"general-purpose:abc"}"#;
+        let json = r#"{"type":"subagent_completed","handle":"general-purpose:abc","outcome":{"kind":"cancelled","message":"user aborted"}}"#;
         let evt: DaemonEvent = serde_json::from_str(json).unwrap();
         match evt {
             DaemonEvent::SubagentCompleted {
                 handle,
+                outcome,
                 result_summary,
             } => {
                 assert_eq!(handle, "general-purpose:abc");
                 assert!(result_summary.is_none());
+                let outcome = outcome.expect("outcome should be present");
+                assert_eq!(outcome.kind, SubagentResultKind::Cancelled);
+                assert_eq!(outcome.message.as_deref(), Some("user aborted"));
             }
             _ => panic!("Expected SubagentCompleted"),
         }
@@ -1988,17 +2035,70 @@ mod tests {
     fn test_translate_subagent_completed() {
         let evt = DaemonEvent::SubagentCompleted {
             handle: "general-purpose:abc".into(),
+            outcome: Some(SubagentOutcome {
+                kind: SubagentResultKind::Failure,
+                message: Some("panicked".into()),
+            }),
             result_summary: Some("All done".into()),
         };
         match translate_event(&evt) {
             EventTranslation::SubagentCompleted {
                 handle,
                 result_summary,
+                outcome_kind,
+                outcome_message,
             } => {
                 assert_eq!(handle, "general-purpose:abc");
                 assert_eq!(result_summary.as_deref(), Some("All done"));
+                assert_eq!(outcome_kind, Some(SubagentResultKind::Failure));
+                assert_eq!(outcome_message.as_deref(), Some("panicked"));
             }
             _ => panic!("Expected SubagentCompleted translation"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_subagent_completed_no_outcome() {
+        // The daemon schema marks `outcome` as required, but we use
+        // #[serde(default)] so that an older daemon (or a partially-formed
+        // event) does not break deserialization.
+        let json =
+            r#"{"type":"subagent_completed","handle":"general-purpose:abc","result_summary":"ok"}"#;
+        let evt: DaemonEvent = serde_json::from_str(json).unwrap();
+        match evt {
+            DaemonEvent::SubagentCompleted {
+                handle,
+                outcome,
+                result_summary,
+            } => {
+                assert_eq!(handle, "general-purpose:abc");
+                assert!(outcome.is_none());
+                assert_eq!(result_summary.as_deref(), Some("ok"));
+            }
+            _ => panic!("Expected SubagentCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_subagent_completed_outcome_all_kinds() {
+        for (kind_str, expected) in [
+            ("success", SubagentResultKind::Success),
+            ("failure", SubagentResultKind::Failure),
+            ("cancelled", SubagentResultKind::Cancelled),
+        ] {
+            let json = format!(
+                r#"{{"type":"subagent_completed","handle":"h","outcome":{{"kind":"{}","message":"m"}}}}"#,
+                kind_str
+            );
+            let evt: DaemonEvent = serde_json::from_str(&json).unwrap();
+            match evt {
+                DaemonEvent::SubagentCompleted { outcome, .. } => {
+                    let outcome = outcome.expect("outcome should be present");
+                    assert_eq!(outcome.kind, expected, "mismatch for kind={}", kind_str);
+                    assert_eq!(outcome.message.as_deref(), Some("m"));
+                }
+                _ => panic!("Expected SubagentCompleted for kind={}", kind_str),
+            }
         }
     }
 
