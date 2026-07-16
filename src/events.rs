@@ -1180,9 +1180,11 @@ pub fn build_plan_from_state(state: &serde_json::Value) -> Option<acp::Plan> {
         return None;
     }
 
+    let total = todos.len();
     let entries: Vec<acp::PlanEntry> = todos
         .iter()
-        .map(|todo| {
+        .enumerate()
+        .map(|(i, todo)| {
             let title = todo
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -1203,7 +1205,17 @@ pub fn build_plan_from_state(state: &serde_json::Value) -> Option<acp::Plan> {
             } else {
                 acp::PlanEntryPriority::Medium
             };
-            acp::PlanEntry::new(title.to_string(), priority, plan_status)
+            // When there are multiple tasks, append a position/count suffix
+            // (e.g. "Investigate the bug (1 of 4)") so the collapsed view in
+            // clients like Paseo — which shows the first incomplete entry's
+            // content as a secondary label — clearly indicates there are more
+            // items to expand.
+            let content = if total > 1 {
+                format!("{} ({} of {})", title, i + 1, total)
+            } else {
+                title.to_string()
+            };
+            acp::PlanEntry::new(content, priority, plan_status)
         })
         .collect();
 
@@ -2468,7 +2480,10 @@ mod tests {
         });
         let plan = build_plan_from_state(&state).expect("plan should exist");
         assert_eq!(plan.entries.len(), 3);
-        assert_eq!(plan.entries[0].content, "Write code");
+        // Multiple tasks get a "(N of M)" suffix for collapsed-view clarity.
+        assert_eq!(plan.entries[0].content, "Write code (1 of 3)");
+        assert_eq!(plan.entries[1].content, "Write tests (2 of 3)");
+        assert_eq!(plan.entries[2].content, "Review (3 of 3)");
         assert_eq!(plan.entries[0].status, acp::PlanEntryStatus::InProgress);
         assert_eq!(plan.entries[0].priority, acp::PlanEntryPriority::High);
         assert_eq!(plan.entries[1].status, acp::PlanEntryStatus::Pending);
@@ -2479,6 +2494,19 @@ mod tests {
     fn test_build_plan_from_state_empty() {
         let state = serde_json::json!({"todos": []});
         assert!(build_plan_from_state(&state).is_none());
+    }
+
+    #[test]
+    fn test_build_plan_from_state_single() {
+        let state = serde_json::json!({
+            "todos": [
+                {"id": 1, "title": "Only task", "status": "pending"},
+            ]
+        });
+        let plan = build_plan_from_state(&state).expect("plan should exist");
+        assert_eq!(plan.entries.len(), 1);
+        // Single task — no count suffix.
+        assert_eq!(plan.entries[0].content, "Only task");
     }
 
     #[test]
