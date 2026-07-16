@@ -756,10 +756,17 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                 .kind(kind)
                 .status(acp::ToolCallStatus::Pending);
             if let Some(input) = input {
-                tool_call = tool_call.raw_input(input.clone());
-                // Extract file locations from input
-                if let Some(locs) = extract_locations(input) {
-                    tool_call = tool_call.locations(locs);
+                // For tools with large/redundant payloads (e.g.
+                // ask_user_question), suppress raw_input and set a
+                // concise title instead so the transcript stays clean.
+                if let Some(title) = tool_call_title_override(name, input) {
+                    tool_call.title = title;
+                } else {
+                    tool_call = tool_call.raw_input(input.clone());
+                    // Extract file locations from input
+                    if let Some(locs) = extract_locations(input) {
+                        tool_call = tool_call.locations(locs);
+                    }
                 }
             }
             EventTranslation::Update(acp::SessionUpdate::ToolCall(tool_call))
@@ -1094,6 +1101,33 @@ pub(crate) fn tool_kind_for_name(name: &str) -> acp::ToolKind {
         }
 
         _ => acp::ToolKind::Other,
+    }
+}
+
+/// Decide whether a tool call's `raw_input` should be suppressed in favor of
+/// a clean human-readable title.
+///
+/// Some tools carry very large JSON inputs that render as noise in the
+/// transcript. `ask_user_question` is the primary case: its full questions
+/// payload (context, options, justifications) is already delivered to the
+/// client via the `_polytoken/ask_user_question` extension request, so the
+/// ToolCall's `raw_input` is redundant. Returning `Some(title)` suppresses
+/// `raw_input` and sets a concise title instead; returning `None` preserves
+/// the default behaviour (set `raw_input`, extract locations).
+pub(crate) fn tool_call_title_override(name: &str, input: &serde_json::Value) -> Option<String> {
+    if name == "ask_user_question" {
+        let count = input
+            .get("questions")
+            .and_then(|q| q.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        Some(if count == 1 {
+            "Asking 1 question".to_string()
+        } else {
+            format!("Asking {} questions", count)
+        })
+    } else {
+        None
     }
 }
 
@@ -1525,6 +1559,51 @@ mod tests {
         match translate_event(&evt) {
             EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
                 assert_eq!(tc.title, "read_file");
+            }
+            _ => panic!("Expected ToolCall update"),
+        }
+    }
+
+    #[test]
+    fn test_translate_tool_call_ask_user_question_suppresses_raw_input() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c1".into(),
+            name: "ask_user_question".into(),
+            input: Some(serde_json::json!({
+                "questions": [
+                    {"id": "q1", "question": "Pick one", "mode": "single_select", "options": []},
+                    {"id": "q2", "question": "Name it", "mode": "text", "options": []},
+                ]
+            })),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                // Title should be a clean summary, not the tool name
+                assert_eq!(tc.title, "Asking 2 questions");
+                // raw_input should be None (suppressed)
+                assert!(
+                    tc.raw_input.is_none(),
+                    "raw_input should be suppressed for ask_user_question, got: {:?}",
+                    tc.raw_input
+                );
+            }
+            _ => panic!("Expected ToolCall update"),
+        }
+    }
+
+    #[test]
+    fn test_translate_tool_call_other_tools_keep_raw_input() {
+        let evt = DaemonEvent::ToolCall {
+            prompt_id: "abc".into(),
+            call_id: "c1".into(),
+            name: "file_read".into(),
+            input: Some(serde_json::json!({"path": "/tmp/test.md"})),
+        };
+        match translate_event(&evt) {
+            EventTranslation::Update(acp::SessionUpdate::ToolCall(tc)) => {
+                assert_eq!(tc.title, "file_read");
+                assert!(tc.raw_input.is_some());
             }
             _ => panic!("Expected ToolCall update"),
         }

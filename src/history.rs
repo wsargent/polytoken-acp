@@ -26,7 +26,7 @@
 use agent_client_protocol::schema::v1 as acp;
 use tracing::debug;
 
-use crate::events::{extract_locations, tool_kind_for_name};
+use crate::events::{extract_locations, tool_call_title_override, tool_kind_for_name};
 
 /// Translate a single daemon history item into zero or more ACP session updates.
 ///
@@ -178,9 +178,16 @@ fn translate_assistant_item(item: &serde_json::Value) -> Vec<acp::SessionUpdate>
                     .kind(kind)
                     .status(acp::ToolCallStatus::Pending);
                 if let Some(input) = block.get("input") {
-                    tool_call = tool_call.raw_input(input.clone());
-                    if let Some(locs) = extract_locations(input) {
-                        tool_call = tool_call.locations(locs);
+                    // For tools with large/redundant payloads (e.g.
+                    // ask_user_question), suppress raw_input and set a
+                    // concise title instead so the transcript stays clean.
+                    if let Some(title) = tool_call_title_override(name, input) {
+                        tool_call.title = title;
+                    } else {
+                        tool_call = tool_call.raw_input(input.clone());
+                        if let Some(locs) = extract_locations(input) {
+                            tool_call = tool_call.locations(locs);
+                        }
                     }
                 }
                 updates.push(acp::SessionUpdate::ToolCall(tool_call));
