@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::DaemonHandle;
-use crate::events::{self, AskUserQuestionPayload, EventTranslation};
+use crate::events::{self, AskUserQuestionPayload, EventTranslation, PlanHandoffContext};
 use crate::history;
 
 /// Shared state across all ACP handlers for one connection.
@@ -2382,6 +2382,22 @@ async fn process_sse_event(
                 .await;
             ConsumeOutcome::Continue
         }
+        EventTranslation::PlanHandoff {
+            interrogative_id,
+            question,
+            context,
+        } => {
+            handle_plan_handoff(
+                conn,
+                &interrogative_id,
+                &question,
+                &context,
+                base_url,
+                bearer_token,
+            )
+            .await;
+            ConsumeOutcome::Continue
+        }
         EventTranslation::SubagentStarted {
             handle,
             subagent_type,
@@ -2819,6 +2835,121 @@ async fn handle_ask_user_question(
     .expect("on_receiving_result failed");
 }
 
+/// Forward a `plan_handoff` interrogative (the plan-to-execution transition) to
+/// the ACP client as a rich single-select question, then relay the chosen
+/// decision back to the daemon as a `plan_handoff_answer`.
+///
+/// Reuses the `_polytoken/ask_user_question` extension request so clients that
+/// already render that surface get the plan review and choices for free. The
+/// response path differs: instead of `ask_user_question_answers`, the selected
+/// option ID is mapped to the daemon's `plan_handoff_answer` decision.
+async fn handle_plan_handoff(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    question: &str,
+    context: &PlanHandoffContext,
+    base_url: &str,
+    bearer_token: &str,
+) {
+    info!(
+        interrogative_id = %interrogative_id,
+        target_facet = %context.target_facet,
+        "Forwarding plan_handoff to ACP client"
+    );
+
+    tracing::info!(
+        target: "polytoken_acp::conv",
+        interrogative_id = %interrogative_id,
+        target_facet = %context.target_facet,
+        "plan_handoff"
+    );
+
+    let payload = events::build_plan_handoff_payload(question, context);
+    let request_json = serde_json::json!({
+        "interrogative_id": interrogative_id,
+        "questions": payload.questions,
+    });
+
+    let params = match serde_json::value::RawValue::from_string(request_json.to_string()) {
+        Ok(raw) => std::sync::Arc::from(raw),
+        Err(e) => {
+            error!(error = %e, "Failed to serialize plan_handoff params");
+            let _ = cancel_interrogative(base_url, bearer_token, interrogative_id).await;
+            return;
+        }
+    };
+
+    let ext_request = acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(
+        "_polytoken/ask_user_question",
+        params,
+    ));
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+
+    let sent = conn.send_request(ext_request);
+    sent.on_receiving_result(async move |result| {
+        let body = match result {
+            Ok(response_value) => {
+                let (selected, free_text) = parse_plan_handoff_answer(&response_value);
+                events::build_plan_handoff_response(selected.as_deref(), free_text.as_deref())
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    interrogative_id = %interrogative_id,
+                    "ACP client does not support plan_handoff choice or request failed; cancelling"
+                );
+                serde_json::json!({ "kind": "cancel" })
+            }
+        };
+
+        info!(
+            interrogative_id = %interrogative_id,
+            decision = ?body.get("decision"),
+            "plan_handoff response from client"
+        );
+        tracing::info!(
+            target: "polytoken_acp::conv",
+            interrogative_id = %interrogative_id,
+            decision = ?body.get("decision"),
+            "plan_handoff_response"
+        );
+
+        if let Err(e) =
+            post_interrogative_response(&base_url, &bearer_token, &interrogative_id, &body).await
+        {
+            error!(error = %e, "Failed to respond to plan_handoff on daemon");
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+/// Extract the first selected option ID and any free-text feedback from an
+/// `ask_user_question` answer response. Returns `(None, _)` when nothing was
+/// selected (client-side cancel).
+fn parse_plan_handoff_answer(value: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let answers = parse_ask_user_question_answers_value(value);
+    let Some(first) = answers.first() else {
+        return (None, None);
+    };
+    let selected = first
+        .get("selected_option_ids")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let free_text = first
+        .get("free_text")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (selected, free_text)
+}
+
 // ---------------------------------------------------------------------------
 // Daemon HTTP helpers (standalone functions for use in spawned tasks)
 // ---------------------------------------------------------------------------
@@ -2952,9 +3083,11 @@ async fn respond_interrogative_permission(
 /// - `confirmation` → `{"kind": "confirmation_answer", "confirmed": granted}`
 /// - `capability` → `{"kind": "capability_answer", "granted": granted}`
 /// - `goal_proposal` → `{"kind": "goal_proposal_answer", "accepted": granted}`
-/// - `plan_handoff` → `{"kind": "plan_handoff_answer", "decision": ...}` (best-effort)
-/// - `clarification` → `{"kind": "clarification_choice", "choice": ...}` (best-effort)
 /// - fallback → `{"kind": "cancel"}` (can't meaningfully answer)
+///
+/// `plan_handoff` interrogatives that carry a structured payload are handled
+/// separately by [`handle_plan_handoff`] and never reach this function; a
+/// `plan_handoff` without a payload falls through to the `cancel` fallback.
 async fn respond_interrogative_generic(
     base_url: &str,
     bearer_token: &str,
@@ -3030,6 +3163,27 @@ async fn respond_ask_user_question(
     Ok(())
 }
 
+/// POST an arbitrary interrogative response body to `/interrogative/{id}/respond`.
+async fn post_interrogative_response(
+    base_url: &str,
+    bearer_token: &str,
+    interrogative_id: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/interrogative/{}/respond", base_url, interrogative_id);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .json(body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "Interrogative response failed");
+    }
+    Ok(())
+}
+
 /// POST `{"kind": "cancel"}` to the daemon to cancel a pending interrogative.
 async fn cancel_interrogative(
     base_url: &str,
@@ -3095,6 +3249,45 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_plan_handoff_answer_selected() {
+        let value = serde_json::json!({
+            "answers": [{
+                "question_id": "plan_handoff",
+                "selected_option_ids": ["implement_new_context"]
+            }]
+        });
+        let (selected, free_text) = parse_plan_handoff_answer(&value);
+        assert_eq!(selected.as_deref(), Some("implement_new_context"));
+        assert_eq!(free_text, None);
+    }
+
+    #[test]
+    fn test_parse_plan_handoff_answer_refuse_with_feedback() {
+        let value = serde_json::json!({
+            "answers": [{
+                "question_id": "plan_handoff",
+                "selected_option_ids": ["refuse"],
+                "free_text": "add acceptance criteria"
+            }]
+        });
+        let (selected, free_text) = parse_plan_handoff_answer(&value);
+        assert_eq!(selected.as_deref(), Some("refuse"));
+        assert_eq!(free_text.as_deref(), Some("add acceptance criteria"));
+    }
+
+    #[test]
+    fn test_parse_plan_handoff_answer_empty_is_cancel() {
+        let (selected, free_text) = parse_plan_handoff_answer(&serde_json::json!({"answers": []}));
+        assert_eq!(selected, None);
+        assert_eq!(free_text, None);
+        // An empty selection maps to a cancel body.
+        assert_eq!(
+            events::build_plan_handoff_response(selected.as_deref(), free_text.as_deref()),
+            serde_json::json!({"kind": "cancel"})
+        );
+    }
 
     #[test]
     fn test_build_thought_level_config_option_effort() {

@@ -70,6 +70,35 @@ If the client does not support this extension or returns no answers, polytoken-a
 
 **Implementation in polytoken-acp:** `src/agent.rs` — `handle_ask_user_question()`.
 
+#### `plan_handoff` reuses this request
+
+The plan-to-execution transition arrives as an `interrogative` event with
+`interrogative_type: "plan_handoff"` and a structured `plan_handoff` payload
+(plan text, title, and action labels). It is a **multi-way** choice — "implement
+in a new context" vs. "implement in current context" vs. "send back with
+feedback" vs. "cancel" — so it cannot be mapped to ACP's binary
+`session/request_permission`.
+
+polytoken-acp synthesizes a single-select `_polytoken/ask_user_question` request
+from the payload (the plan text becomes the question `context`; each action
+label becomes an option whose `id` is the daemon decision string), so clients
+that already render `ask_user_question` get the plan review and choices for free.
+The **response** differs: instead of `ask_user_question_answers`, the selected
+option is mapped back to the daemon's `plan_handoff_answer`:
+
+```json
+{ "kind": "plan_handoff_answer", "decision": "implement_new_context" }
+{ "kind": "plan_handoff_answer", "decision": "implement_current_context" }
+{ "kind": "plan_handoff_answer", "decision": "refuse", "feedback": "<free_text>" }
+```
+
+Selecting `cancel`, returning no answer, or an unrecognized option maps to the
+sibling `{"kind":"cancel"}` response so the agent can proceed rather than hang.
+If the client doesn't support the extension, the interrogative is cancelled.
+
+**Implementation in polytoken-acp:** `src/agent.rs` — `handle_plan_handoff()`;
+`src/events.rs` — `build_plan_handoff_payload()`, `build_plan_handoff_response()`.
+
 ### 2. `_polytoken/system_reminder` (Extension Notification)
 
 Sent when the Polytoken daemon emits a `system_reminder` event. This is a **notification** — one-way, no response expected. The daemon emits these based on its [permission rules and system hooks](https://docs.polytoken.dev/reference/configuration/).

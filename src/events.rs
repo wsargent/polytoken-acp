@@ -88,6 +88,11 @@ pub enum DaemonEvent {
         interrogative_id: String,
         question: String,
         interrogative_type: String,
+        /// Structured payload present when `interrogative_type == "plan_handoff"`.
+        /// Carries the plan review surface (plan text, title, action labels) so
+        /// non-TUI clients can render the plan-to-execution choice.
+        #[serde(default)]
+        plan_handoff: Option<PlanHandoffContext>,
     },
     #[serde(rename = "ask_user_question")]
     AskUserQuestion {
@@ -292,6 +297,36 @@ fn default_true() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// plan_handoff interrogative payload types (from daemon SSE events)
+// ---------------------------------------------------------------------------
+
+/// Structured payload attached to a `plan_handoff` interrogative.
+///
+/// The daemon carries the presentation strings on the event so non-TUI clients
+/// (like polytoken-acp) can render the same plan-review surface without
+/// reconstructing daemon-local state. This is the "plan → execution" transition.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[allow(dead_code)]
+pub struct PlanHandoffContext {
+    pub plan_path: String,
+    pub display_path: String,
+    pub plan_text: String,
+    pub target_facet: String,
+    pub title: String,
+    pub action_labels: PlanHandoffActionLabels,
+}
+
+/// Human-readable labels for each plan-handoff decision, supplied by the daemon.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct PlanHandoffActionLabels {
+    pub implement_new_context: String,
+    pub implement_current_context: String,
+    pub cancel: String,
+    #[serde(default)]
+    pub refuse: String,
+}
+
+// ---------------------------------------------------------------------------
 // Translation: daemon event → ACP SessionUpdate
 // ---------------------------------------------------------------------------
 
@@ -322,6 +357,14 @@ pub enum EventTranslation {
     AskUserQuestion {
         interrogative_id: String,
         payload: AskUserQuestionPayload,
+    },
+    /// A `plan_handoff` interrogative — the plan-to-execution transition. Carries
+    /// the structured plan-review context so it can be forwarded as a rich
+    /// single-select question and answered with a `plan_handoff_answer`.
+    PlanHandoff {
+        interrogative_id: String,
+        question: String,
+        context: PlanHandoffContext,
     },
     /// A subagent started — emit a ToolCall + extension notification.
     SubagentStarted {
@@ -767,6 +810,7 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             interrogative_id,
             question,
             interrogative_type,
+            plan_handoff,
             ..
         } => {
             if interrogative_type == "permission" {
@@ -774,6 +818,19 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                 EventTranslation::PermissionRequest {
                     interrogative_id: interrogative_id.clone(),
                     question: question.clone(),
+                }
+            } else if interrogative_type == "plan_handoff"
+                && let Some(context) = plan_handoff
+            {
+                // The plan-to-execution transition is a multi-way choice
+                // (new context / current context / refuse / cancel). Forward it
+                // as a rich single-select question rather than a binary
+                // allow/reject so the user's decision reaches the daemon intact.
+                debug!("plan_handoff interrogative from daemon; forwarding as structured choice");
+                EventTranslation::PlanHandoff {
+                    interrogative_id: interrogative_id.clone(),
+                    question: question.clone(),
+                    context: context.clone(),
                 }
             } else {
                 // Forward non-permission interrogatives (confirmation, clarification,
@@ -1131,6 +1188,109 @@ pub fn build_permission_options() -> Vec<acp::PermissionOption> {
     ]
 }
 
+/// Decision option IDs for a plan-handoff, matching the daemon's
+/// `PlanHandoffDecision` variants (the value of `plan_handoff_answer.decision`).
+pub const PLAN_HANDOFF_NEW_CONTEXT: &str = "implement_new_context";
+pub const PLAN_HANDOFF_CURRENT_CONTEXT: &str = "implement_current_context";
+pub const PLAN_HANDOFF_REFUSE: &str = "refuse";
+/// Not a `PlanHandoffDecision`; maps to the sibling `{"kind":"cancel"}` response.
+pub const PLAN_HANDOFF_CANCEL: &str = "cancel";
+/// The synthesized question ID used when forwarding a plan-handoff as an
+/// `ask_user_question` (single-select). Answers echo this back.
+pub const PLAN_HANDOFF_QUESTION_ID: &str = "plan_handoff";
+
+/// Build a single-select `ask_user_question` payload from a plan-handoff
+/// interrogative. The plan text becomes the question `context` so the client
+/// can render the same review surface the TUI shows; each action label becomes
+/// a selectable option whose ID is the daemon decision string.
+pub fn build_plan_handoff_payload(
+    question: &str,
+    context: &PlanHandoffContext,
+) -> AskUserQuestionPayload {
+    let labels = &context.action_labels;
+    let mut options = vec![
+        AskUserQuestionOption {
+            id: PLAN_HANDOFF_NEW_CONTEXT.to_string(),
+            label: labels.implement_new_context.clone(),
+            description: "Hand the plan off to a fresh execution context.".to_string(),
+            justification: None,
+            preview: None,
+        },
+        AskUserQuestionOption {
+            id: PLAN_HANDOFF_CURRENT_CONTEXT.to_string(),
+            label: labels.implement_current_context.clone(),
+            description: "Continue implementing in the current context.".to_string(),
+            justification: None,
+            preview: None,
+        },
+    ];
+    // `refuse` is optional: the daemon leaves the label empty when unavailable.
+    if !labels.refuse.is_empty() {
+        options.push(AskUserQuestionOption {
+            id: PLAN_HANDOFF_REFUSE.to_string(),
+            label: labels.refuse.clone(),
+            description: "Send the plan back with feedback instead of implementing it.".to_string(),
+            justification: None,
+            preview: None,
+        });
+    }
+    options.push(AskUserQuestionOption {
+        id: PLAN_HANDOFF_CANCEL.to_string(),
+        label: labels.cancel.clone(),
+        description: "Dismiss the handoff without a decision.".to_string(),
+        justification: None,
+        preview: None,
+    });
+
+    // Surface the plan text (and its display path) as review context.
+    let context_md = format!(
+        "**{}**\n\n`{}`\n\n{}",
+        context.title, context.display_path, context.plan_text
+    );
+
+    AskUserQuestionPayload {
+        questions: vec![AskUserQuestionItem {
+            id: PLAN_HANDOFF_QUESTION_ID.to_string(),
+            context: Some(context_md),
+            question: question.to_string(),
+            mode: AskUserQuestionMode::SingleSelect,
+            // Free text is the `refuse` feedback channel.
+            allow_free_text: true,
+            options,
+        }],
+    }
+}
+
+/// Map a selected plan-handoff option ID (and any free-text feedback) to the
+/// daemon response body posted to `/interrogative/{id}/respond`.
+///
+/// - `implement_new_context` / `implement_current_context` →
+///   `{"kind":"plan_handoff_answer","decision":<id>}`
+/// - `refuse` → `{"kind":"plan_handoff_answer","decision":"refuse","feedback":<text>}`
+/// - `cancel`, `None`, or an unknown ID → `{"kind":"cancel"}` (safe default so
+///   the agent can proceed rather than hang)
+pub fn build_plan_handoff_response(
+    selected_option_id: Option<&str>,
+    free_text: Option<&str>,
+) -> serde_json::Value {
+    match selected_option_id {
+        Some(PLAN_HANDOFF_NEW_CONTEXT) => serde_json::json!({
+            "kind": "plan_handoff_answer",
+            "decision": PLAN_HANDOFF_NEW_CONTEXT,
+        }),
+        Some(PLAN_HANDOFF_CURRENT_CONTEXT) => serde_json::json!({
+            "kind": "plan_handoff_answer",
+            "decision": PLAN_HANDOFF_CURRENT_CONTEXT,
+        }),
+        Some(PLAN_HANDOFF_REFUSE) => serde_json::json!({
+            "kind": "plan_handoff_answer",
+            "decision": PLAN_HANDOFF_REFUSE,
+            "feedback": free_text.unwrap_or(""),
+        }),
+        _ => serde_json::json!({ "kind": "cancel" }),
+    }
+}
+
 /// Resolve a permission outcome to a boolean granted value.
 /// Returns (granted, option_id_was_allow) for testability.
 pub fn resolve_permission_outcome(outcome: &acp::RequestPermissionOutcome) -> bool {
@@ -1430,6 +1590,7 @@ mod tests {
             interrogative_id: "int_1".into(),
             question: "Allow?".into(),
             interrogative_type: "permission".into(),
+            plan_handoff: None,
         };
         match translate_event(&evt) {
             EventTranslation::PermissionRequest {
@@ -1797,6 +1958,7 @@ mod tests {
             interrogative_id: "int_1".into(),
             question: "Are you sure?".into(),
             interrogative_type: "confirmation".into(),
+            plan_handoff: None,
         };
         match translate_event(&evt) {
             EventTranslation::InterrogativeRequest {
@@ -2422,5 +2584,153 @@ mod tests {
             }
             _ => panic!("Expected PermissionMonitorSwitch translation"),
         }
+    }
+
+    fn sample_plan_handoff_json() -> &'static str {
+        r#"{
+            "type":"interrogative",
+            "prompt_id":"p1",
+            "interrogative_id":"i1",
+            "question":"Ready to implement?",
+            "interrogative_type":"plan_handoff",
+            "plan_handoff":{
+                "plan_path":"/tmp/plan.md",
+                "display_path":"plan.md",
+                "plan_text":"Step 1. Do the thing.",
+                "target_facet":"execute",
+                "title":"Implementation Plan",
+                "action_labels":{
+                    "implement_new_context":"Implement in a new context",
+                    "implement_current_context":"Implement in current context",
+                    "cancel":"Cancel",
+                    "refuse":"Send back with feedback"
+                }
+            }
+        }"#
+    }
+
+    #[test]
+    fn test_translate_plan_handoff_interrogative() {
+        let evt: DaemonEvent = serde_json::from_str(sample_plan_handoff_json()).unwrap();
+        match translate_event(&evt) {
+            EventTranslation::PlanHandoff {
+                interrogative_id,
+                context,
+                ..
+            } => {
+                assert_eq!(interrogative_id, "i1");
+                assert_eq!(context.target_facet, "execute");
+                assert_eq!(context.plan_text, "Step 1. Do the thing.");
+                assert_eq!(
+                    context.action_labels.implement_new_context,
+                    "Implement in a new context"
+                );
+            }
+            _ => panic!("Expected PlanHandoff translation"),
+        }
+    }
+
+    #[test]
+    fn test_plan_handoff_missing_context_falls_back() {
+        // Without the structured payload we cannot render the choice; fall back
+        // to the generic interrogative path rather than dropping the event.
+        let evt = DaemonEvent::Interrogative {
+            prompt_id: "p1".into(),
+            interrogative_id: "i1".into(),
+            question: "Ready?".into(),
+            interrogative_type: "plan_handoff".into(),
+            plan_handoff: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::InterrogativeRequest {
+                interrogative_type, ..
+            } => assert_eq!(interrogative_type, "plan_handoff"),
+            _ => panic!("Expected InterrogativeRequest fallback"),
+        }
+    }
+
+    #[test]
+    fn test_build_plan_handoff_payload_options() {
+        let evt: DaemonEvent = serde_json::from_str(sample_plan_handoff_json()).unwrap();
+        let context = match evt {
+            DaemonEvent::Interrogative {
+                plan_handoff: Some(c),
+                ..
+            } => c,
+            _ => unreachable!(),
+        };
+        let payload = build_plan_handoff_payload("Ready?", &context);
+        let q = &payload.questions[0];
+        assert_eq!(q.mode, AskUserQuestionMode::SingleSelect);
+        assert!(q.allow_free_text);
+        let ids: Vec<&str> = q.options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                PLAN_HANDOFF_NEW_CONTEXT,
+                PLAN_HANDOFF_CURRENT_CONTEXT,
+                PLAN_HANDOFF_REFUSE,
+                PLAN_HANDOFF_CANCEL,
+            ]
+        );
+        // The plan text is surfaced as review context.
+        assert!(
+            q.context
+                .as_ref()
+                .unwrap()
+                .contains("Step 1. Do the thing.")
+        );
+    }
+
+    #[test]
+    fn test_build_plan_handoff_payload_omits_empty_refuse() {
+        let mut context: PlanHandoffContext =
+            match serde_json::from_str::<DaemonEvent>(sample_plan_handoff_json()).unwrap() {
+                DaemonEvent::Interrogative {
+                    plan_handoff: Some(c),
+                    ..
+                } => c,
+                _ => unreachable!(),
+            };
+        context.action_labels.refuse = String::new();
+        let payload = build_plan_handoff_payload("Ready?", &context);
+        let ids: Vec<&str> = payload.questions[0]
+            .options
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect();
+        assert!(!ids.contains(&PLAN_HANDOFF_REFUSE));
+    }
+
+    #[test]
+    fn test_build_plan_handoff_response_decisions() {
+        assert_eq!(
+            build_plan_handoff_response(Some(PLAN_HANDOFF_NEW_CONTEXT), None),
+            serde_json::json!({"kind":"plan_handoff_answer","decision":"implement_new_context"})
+        );
+        assert_eq!(
+            build_plan_handoff_response(Some(PLAN_HANDOFF_CURRENT_CONTEXT), None),
+            serde_json::json!({"kind":"plan_handoff_answer","decision":"implement_current_context"})
+        );
+        assert_eq!(
+            build_plan_handoff_response(Some(PLAN_HANDOFF_REFUSE), Some("needs tests")),
+            serde_json::json!({"kind":"plan_handoff_answer","decision":"refuse","feedback":"needs tests"})
+        );
+    }
+
+    #[test]
+    fn test_build_plan_handoff_response_cancel_and_unknown() {
+        assert_eq!(
+            build_plan_handoff_response(Some(PLAN_HANDOFF_CANCEL), None),
+            serde_json::json!({"kind":"cancel"})
+        );
+        assert_eq!(
+            build_plan_handoff_response(None, None),
+            serde_json::json!({"kind":"cancel"})
+        );
+        assert_eq!(
+            build_plan_handoff_response(Some("bogus"), None),
+            serde_json::json!({"kind":"cancel"})
+        );
     }
 }
