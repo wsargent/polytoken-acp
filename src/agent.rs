@@ -17,6 +17,8 @@ use agent_client_protocol::{
 use anyhow::{Context, bail};
 use tracing::{debug, error, info, warn};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::daemon::DaemonHandle;
 use crate::events::{self, AskUserQuestionPayload, EventTranslation};
 use crate::history;
@@ -29,6 +31,10 @@ struct AgentState {
     /// execution. The channel has capacity 1: one in-flight turn + one
     /// pending. A third prompt is rejected with a structured error.
     prompt_queues: HashMap<String, tokio::sync::mpsc::Sender<PromptQueueItem>>,
+    /// Per-session cancel tokens for the currently in-flight turn.
+    /// `handle_cancel` triggers these to proactively unblock the `SseConsumer`
+    /// even when the daemon never emits a `TurnCancelled` SSE event.
+    cancel_tokens: HashMap<String, CancellationToken>,
 }
 
 /// A queued prompt awaiting execution by the per-session processor task.
@@ -48,6 +54,7 @@ impl AgentState {
         Self {
             sessions: HashMap::new(),
             prompt_queues: HashMap::new(),
+            cancel_tokens: HashMap::new(),
         }
     }
 
@@ -56,6 +63,8 @@ impl AgentState {
     async fn shutdown(&mut self) {
         // Drop all queue senders first — this stops the processor tasks.
         self.prompt_queues.clear();
+        // Cancel any in-flight turns.
+        self.cancel_tokens.clear();
         let daemons: Vec<(String, DaemonHandle)> = self.sessions.drain().collect();
         for (_, mut daemon) in daemons {
             daemon.terminate().await;
@@ -810,6 +819,7 @@ async fn handle_close_session(
     let daemon = {
         let mut sessions = state.lock().unwrap();
         sessions.prompt_queues.remove(&session_id);
+        sessions.cancel_tokens.remove(&session_id);
         sessions.sessions.remove(&session_id)
     };
 
@@ -945,9 +955,25 @@ fn spawn_prompt_processor(
         .prompt_queues
         .insert(session_id.to_string(), tx);
 
+    let state = Arc::clone(state);
+    let session_id = session_id.to_string();
+
     cx.spawn(async move {
         while let Some(item) = rx.recv().await {
-            run_prompt_turn(item).await;
+            // Register a cancel token for this in-flight turn so that
+            // `handle_cancel` can proactively terminate the SseConsumer.
+            let cancel_token = CancellationToken::new();
+            {
+                let mut s = state.lock().unwrap();
+                s.cancel_tokens
+                    .insert(session_id.clone(), cancel_token.clone());
+            }
+
+            run_prompt_turn(item, cancel_token).await;
+
+            // Clean up the cancel token (harmless no-op if handle_cancel
+            // already removed and triggered it).
+            state.lock().unwrap().cancel_tokens.remove(&session_id);
         }
         // Channel closed — all senders dropped (session closed).
         Ok(())
@@ -958,7 +984,7 @@ fn spawn_prompt_processor(
 
 /// Execute a single prompt turn: send the prompt to the daemon, then run the
 /// SSE consumer to completion. Called by the per-session processor task.
-async fn run_prompt_turn(item: PromptQueueItem) {
+async fn run_prompt_turn(item: PromptQueueItem, cancel_token: CancellationToken) {
     let prompt_id = match DaemonHandle::prompt_with(
         &item.base_url,
         &item.bearer_token,
@@ -997,8 +1023,10 @@ async fn run_prompt_turn(item: PromptQueueItem) {
     };
 
     // Await the SSE consumer to completion (do NOT spawn — the processor
-    // task serializes turns by blocking on each consumer).
-    if let Err(e) = consumer.run().await {
+    // task serializes turns by blocking on each consumer). The cancel token
+    // allows handle_cancel to proactively unblock this await when the daemon
+    // fails to emit a turn-end SSE event.
+    if let Err(e) = consumer.run(cancel_token).await {
         error!(error = %e, "SseConsumer run failed");
     }
 }
@@ -1015,25 +1043,37 @@ async fn handle_cancel(state: &Arc<Mutex<AgentState>>, notif: &acp::CancelNotifi
 
     // We need to take the daemon out briefly to call cancel (which is async).
     // Since we can't hold the lock across await, we clone the necessary bits.
-    let (base_url, bearer) = {
-        let sessions = state.lock().unwrap();
-        match sessions.sessions.get(&session_id) {
-            Some(daemon) => (
+    // We also grab the per-session cancel token so we can proactively unblock
+    // the SseConsumer even when the daemon never emits a TurnCancelled event.
+    let (daemon_info, cancel_token) = {
+        let mut sessions = state.lock().unwrap();
+        let info = sessions.sessions.get(&session_id).map(|daemon| {
+            (
                 daemon.base_url().to_string(),
                 daemon.bearer_token().to_string(),
-            ),
-            None => return,
-        }
+            )
+        });
+        let token = sessions.cancel_tokens.remove(&session_id);
+        (info, token)
     };
 
+    // Trigger the local cancel token first so the responder is freed
+    // immediately — do not wait for the daemon HTTP cancel to return.
+    if let Some(token) = cancel_token {
+        token.cancel();
+        info!(session_id = %session_id, "Cancel token triggered for in-flight turn");
+    }
+
     // Cancel via HTTP directly (no lock needed)
-    let client = reqwest::Client::new();
-    let url = format!("{}/turn/cancel", base_url);
-    let _ = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", bearer))
-        .send()
-        .await;
+    if let Some((base_url, bearer)) = daemon_info {
+        let client = reqwest::Client::new();
+        let url = format!("{}/turn/cancel", base_url);
+        let _ = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", bearer))
+            .send()
+            .await;
+    }
 }
 
 /// Build the ACP SessionModeState from the daemon's permission monitor state.
@@ -2046,7 +2086,10 @@ struct SseConsumer {
 }
 
 impl SseConsumer {
-    async fn run(self) -> Result<(), agent_client_protocol::Error> {
+    async fn run(
+        self,
+        cancel_token: CancellationToken,
+    ) -> Result<(), agent_client_protocol::Error> {
         let max_retries = 3;
         let mut retry_count = 0;
 
@@ -2060,17 +2103,31 @@ impl SseConsumer {
         let mut responder = Some(self.responder);
 
         loop {
-            match connect_and_consume(
-                &events_url,
-                &bearer_token,
-                &base_url,
-                &prompt_id,
-                &session_id,
-                &cwd,
-                &conn,
-            )
-            .await
-            {
+            // Race the SSE consumer against the cancel token. When the daemon
+            // never emits a turn-end SSE event (LLM call did not settle
+            // cleanly), the TCP connection stays alive but silent. The cancel
+            // token lets handle_cancel proactively break out of the blocked
+            // `stream.next().await` inside connect_and_consume.
+            let outcome = tokio::select! {
+                result = connect_and_consume(
+                    &events_url,
+                    &bearer_token,
+                    &base_url,
+                    &prompt_id,
+                    &session_id,
+                    &cwd,
+                    &conn,
+                ) => result,
+                _ = cancel_token.cancelled() => {
+                    info!(
+                        prompt_id = %prompt_id,
+                        "Turn cancelled via cancel token"
+                    );
+                    ConsumeOutcome::Done(acp::StopReason::Cancelled)
+                }
+            };
+
+            match outcome {
                 ConsumeOutcome::Done(stop_reason) => {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     info!(
@@ -2114,7 +2171,22 @@ impl SseConsumer {
                         retry = retry_count,
                         "SSE connection error; retrying"
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    // Also honour cancellation during the retry backoff.
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        _ = cancel_token.cancelled() => {
+                            info!(
+                                prompt_id = %prompt_id,
+                                "Turn cancelled during retry backoff"
+                            );
+                            return responder
+                                .take()
+                                .expect("responder already consumed")
+                                .respond(acp::PromptResponse::new(
+                                    acp::StopReason::Cancelled,
+                                ));
+                        }
+                    }
                 }
                 ConsumeOutcome::Continue => {}
             }
@@ -3573,5 +3645,53 @@ mod tests {
                 panic!("Expected Full, got Closed");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_token_unblocks_blocked_consumer() {
+        // Simulates the core fix for issue #48: when the daemon's SSE stream
+        // goes silent (TCP keepalive keeps the connection alive), the
+        // `connect_and_consume` future never resolves. The cancel token
+        // lets handle_cancel proactively break the blocked select!.
+        let token = CancellationToken::new();
+        let consumer_token = token.clone();
+
+        // Spawn a task that simulates the blocked SseConsumer::run select!.
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                // This would be connect_and_consume(...) — a future that
+                // never resolves because the SSE stream is silent.
+                _ = std::future::pending::<()>() => "pending",
+                _ = consumer_token.cancelled() => "cancelled",
+            }
+        });
+
+        // Without cancelling, the consumer would block forever.
+        // Trigger the cancel token (as handle_cancel does).
+        token.cancel();
+
+        // The consumer task should resolve promptly with "cancelled".
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+
+        assert!(result.is_ok(), "consumer was not unblocked after cancel");
+        assert_eq!(result.unwrap().unwrap(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_cancel_token_not_triggered_on_normal_completion() {
+        // When the SSE consumer completes normally (without cancel), the
+        // cancel token stays untriggered — the processor task simply
+        // removes it from the map.
+        let token = CancellationToken::new();
+        let consumer_token = token.clone();
+
+        // Simulate normal completion: connect_and_consume resolves first.
+        let result = tokio::select! {
+            _ = std::future::ready(()) => "done",
+            _ = consumer_token.cancelled() => "cancelled",
+        };
+
+        assert_eq!(result, "done");
+        assert!(!token.is_cancelled());
     }
 }
