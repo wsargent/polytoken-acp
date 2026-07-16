@@ -57,11 +57,26 @@ Then launch Paseo, select "Polytoken" as the provider, and start a session.
 ## How It Works
 
 1. **Paseo spawns `polytoken-acp`** as a subprocess and communicates over stdio using JSON-RPC (ACP).
-2. **On `session/new`**, the shim spawns a `polytoken daemon` process for the session's working directory, using a random port and credential file.
+2. **On `session/new`**, the shim spawns a `polytoken daemon` process for the session's working directory, using a random port and credential file. The daemon uses a dedicated sessions directory (`~/.local/share/polytoken/sessions-acp/`), separate from the default `sessions/` used by the polytoken TUI — see [Session Directory Isolation](#session-directory-isolation) below.
 3. **On `session/prompt`**, the shim forwards the prompt text to the daemon's `POST /prompt` endpoint, then connects to the daemon's SSE event stream (`GET /events`) and translates daemon events into ACP `session/update` notifications.
 4. **Permission requests** (interrogative events) are forwarded to the ACP client via `session/request_permission`, and responses are relayed back to the daemon via `POST /interrogative/{id}/respond`. **`ask_user_question` events** are forwarded via the `polytoken/ask_user_question` extension method, and answers are relayed back.
 5. **On `session/cancel`**, the shim calls `POST /turn/cancel` on the daemon.
 6. **On disconnect** (stdin EOF), the shim terminates all daemon processes.
+
+### Session Directory Isolation
+
+ACP-managed daemon sessions are registered in a **separate** directory from the polytoken TUI:
+
+| | Directory |
+|---|---|
+| **ACP shim** (`polytoken-acp`) | `~/.local/share/polytoken/sessions-acp/` |
+| **TUI** (`polytoken new` / `attach` / `continue`) | `~/.local/share/polytoken/sessions/` (default) |
+
+**Why this matters:** The polytoken TUI discovers live and resumable sessions by scanning `sessions/`. If an ACP-managed daemon were registered there, a user could attach a TUI to the same daemon the ACP shim is driving. When the ACP connection ends (Paseo window closed, stdin EOF, or process exit), the shim's cleanup code terminates its daemon — which would silently kill the TUI's SSE stream with confusing "SSE errors."
+
+By using a separate directory, ACP sessions are invisible to `polytoken sessions`, `polytoken attach <id>`, and `polytoken continue`. ACP resume (`session/load`) still works because the shim always passes `--sessions-dir sessions-acp` so `--resume` finds the saved history.
+
+If you need to inspect an ACP session manually (logs, startup.json, history), look under `sessions-acp/<session_id>/` instead of the default `sessions/` directory.
 
 ### Event Translation
 
