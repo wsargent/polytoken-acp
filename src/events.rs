@@ -93,6 +93,11 @@ pub enum DaemonEvent {
         /// non-TUI clients can render the plan-to-execution choice.
         #[serde(default)]
         plan_handoff: Option<PlanHandoffContext>,
+        /// Structured payload present when `interrogative_type == "goal_proposal"`.
+        /// Carries the proposed goal summary, title, and action labels so
+        /// non-TUI clients can render the goal-approval surface.
+        #[serde(default)]
+        goal_proposal: Option<GoalProposalContext>,
     },
     #[serde(rename = "ask_user_question")]
     AskUserQuestion {
@@ -327,6 +332,33 @@ pub struct PlanHandoffActionLabels {
 }
 
 // ---------------------------------------------------------------------------
+// goal_proposal interrogative payload types (from daemon SSE events)
+// ---------------------------------------------------------------------------
+
+/// Structured payload attached to a `goal_proposal` interrogative.
+///
+/// The daemon carries presentation strings on the event so non-TUI clients
+/// (like polytoken-acp) can render the same goal-approval surface without
+/// reconstructing daemon-local state.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[allow(dead_code)]
+pub struct GoalProposalContext {
+    pub proposed_summary: String,
+    #[serde(default)]
+    pub proposed_file_path: Option<String>,
+    pub title: String,
+    pub action_labels: GoalProposalActionLabels,
+}
+
+/// Human-readable labels for the binary approve/reject affordance on a goal
+/// proposal.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct GoalProposalActionLabels {
+    pub accept: String,
+    pub reject: String,
+}
+
+// ---------------------------------------------------------------------------
 // Translation: daemon event → ACP SessionUpdate
 // ---------------------------------------------------------------------------
 
@@ -365,6 +397,15 @@ pub enum EventTranslation {
         interrogative_id: String,
         question: String,
         context: PlanHandoffContext,
+    },
+    /// A `goal_proposal` interrogative — the model proposed a goal that needs
+    /// operator approval. Carries the proposed summary, title, and accept/reject
+    /// labels so it can be forwarded as a single-select question and answered
+    /// with a `goal_proposal_answer`.
+    GoalProposal {
+        interrogative_id: String,
+        question: String,
+        context: GoalProposalContext,
     },
     /// A subagent started — emit a ToolCall + extension notification.
     SubagentStarted {
@@ -818,6 +859,7 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
             question,
             interrogative_type,
             plan_handoff,
+            goal_proposal,
             ..
         } => {
             if interrogative_type == "permission" {
@@ -839,9 +881,23 @@ pub fn translate_event(evt: &DaemonEvent) -> EventTranslation {
                     question: question.clone(),
                     context: context.clone(),
                 }
+            } else if interrogative_type == "goal_proposal"
+                && let Some(context) = goal_proposal
+            {
+                // The model proposed a goal that needs operator approval.
+                // Forward it as a structured single-select question
+                // (accept/reject) so the user's decision reaches the daemon
+                // intact. Falling through to the generic permission path
+                // causes Paseo to auto-reject, so we must handle it here.
+                debug!("goal_proposal interrogative from daemon; forwarding as structured choice");
+                EventTranslation::GoalProposal {
+                    interrogative_id: interrogative_id.clone(),
+                    question: question.clone(),
+                    context: context.clone(),
+                }
             } else {
                 // Forward non-permission interrogatives (confirmation, clarification,
-                // capability, plan_handoff, goal_proposal) as permission-like requests
+                // capability) as permission-like requests
                 debug!(
                     interrogative_type = %interrogative_type,
                     "Non-permission interrogative from daemon; forwarding to ACP client"
@@ -1337,6 +1393,72 @@ pub fn build_plan_handoff_response(
     }
 }
 
+/// Decision option IDs for a goal-proposal, matching the daemon's binary
+/// goal-proposal answer: `{"kind":"goal_proposal_answer","accepted":<bool>}`.
+/// These are the option IDs sent in the `ask_user_question` and parsed back
+/// from the answer.
+pub const GOAL_PROPOSAL_ACCEPT: &str = "accept";
+pub const GOAL_PROPOSAL_REJECT: &str = "reject";
+/// The synthesized question ID used when forwarding a goal-proposal as an
+/// `ask_user_question` (single-select). Answers echo this back.
+pub const GOAL_PROPOSAL_QUESTION_ID: &str = "goal_proposal";
+
+/// Build a single-select `ask_user_question` payload from a goal-proposal
+/// interrogative. The proposed goal summary becomes the question `context` so
+/// the client can render the same approval surface the TUI shows; the accept
+/// and reject labels from the daemon become selectable options.
+pub fn build_goal_proposal_payload(
+    question: &str,
+    context: &GoalProposalContext,
+) -> AskUserQuestionPayload {
+    let labels = &context.action_labels;
+    let options = vec![
+        AskUserQuestionOption {
+            id: GOAL_PROPOSAL_ACCEPT.to_string(),
+            label: labels.accept.clone(),
+            description: "Accept the proposed goal and set it as the active session goal."
+                .to_string(),
+            justification: None,
+            preview: None,
+        },
+        AskUserQuestionOption {
+            id: GOAL_PROPOSAL_REJECT.to_string(),
+            label: labels.reject.clone(),
+            description: "Reject the proposed goal. The agent will proceed without one."
+                .to_string(),
+            justification: None,
+            preview: None,
+        },
+    ];
+
+    // Surface the proposed goal summary as review context.
+    let context_md = format!("**{}**\n\n{}", context.title, context.proposed_summary);
+
+    AskUserQuestionPayload {
+        questions: vec![AskUserQuestionItem {
+            id: GOAL_PROPOSAL_QUESTION_ID.to_string(),
+            context: Some(context_md),
+            question: question.to_string(),
+            mode: AskUserQuestionMode::SingleSelect,
+            allow_free_text: false,
+            options,
+        }],
+    }
+}
+
+/// Map a selected goal-proposal option ID to the daemon response body posted
+/// to `/interrogative/{id}/respond`.
+///
+/// - `accept` → `{"kind":"goal_proposal_answer","accepted":true}`
+/// - `reject`, `None`, or unknown → `{"kind":"goal_proposal_answer","accepted":false}`
+pub fn build_goal_proposal_response(selected_option_id: Option<&str>) -> serde_json::Value {
+    let accepted = matches!(selected_option_id, Some(GOAL_PROPOSAL_ACCEPT));
+    serde_json::json!({
+        "kind": "goal_proposal_answer",
+        "accepted": accepted,
+    })
+}
+
 /// Resolve a permission outcome to a boolean granted value.
 /// Returns (granted, option_id_was_allow) for testability.
 pub fn resolve_permission_outcome(outcome: &acp::RequestPermissionOutcome) -> bool {
@@ -1682,6 +1804,7 @@ mod tests {
             question: "Allow?".into(),
             interrogative_type: "permission".into(),
             plan_handoff: None,
+            goal_proposal: None,
         };
         match translate_event(&evt) {
             EventTranslation::PermissionRequest {
@@ -2050,6 +2173,7 @@ mod tests {
             question: "Are you sure?".into(),
             interrogative_type: "confirmation".into(),
             plan_handoff: None,
+            goal_proposal: None,
         };
         match translate_event(&evt) {
             EventTranslation::InterrogativeRequest {
@@ -2747,6 +2871,7 @@ mod tests {
             question: "Ready?".into(),
             interrogative_type: "plan_handoff".into(),
             plan_handoff: None,
+            goal_proposal: None,
         };
         match translate_event(&evt) {
             EventTranslation::InterrogativeRequest {
@@ -2754,6 +2879,76 @@ mod tests {
             } => assert_eq!(interrogative_type, "plan_handoff"),
             _ => panic!("Expected InterrogativeRequest fallback"),
         }
+    }
+
+    #[test]
+    fn test_translate_goal_proposal() {
+        let evt = DaemonEvent::Interrogative {
+            prompt_id: "p1".into(),
+            interrogative_id: "i1".into(),
+            question: "Accept this goal?".into(),
+            interrogative_type: "goal_proposal".into(),
+            plan_handoff: None,
+            goal_proposal: Some(GoalProposalContext {
+                proposed_summary: "Ship the feature".into(),
+                proposed_file_path: None,
+                title: "Goal Proposal".into(),
+                action_labels: GoalProposalActionLabels {
+                    accept: "Accept".into(),
+                    reject: "Reject".into(),
+                },
+            }),
+        };
+        match translate_event(&evt) {
+            EventTranslation::GoalProposal {
+                interrogative_id,
+                context,
+                ..
+            } => {
+                assert_eq!(interrogative_id, "i1");
+                assert_eq!(context.proposed_summary, "Ship the feature");
+            }
+            _ => panic!("Expected GoalProposal"),
+        }
+    }
+
+    #[test]
+    fn test_goal_proposal_missing_context_falls_back() {
+        let evt = DaemonEvent::Interrogative {
+            prompt_id: "p1".into(),
+            interrogative_id: "i1".into(),
+            question: "Accept?".into(),
+            interrogative_type: "goal_proposal".into(),
+            plan_handoff: None,
+            goal_proposal: None,
+        };
+        match translate_event(&evt) {
+            EventTranslation::InterrogativeRequest {
+                interrogative_type, ..
+            } => assert_eq!(interrogative_type, "goal_proposal"),
+            _ => panic!("Expected InterrogativeRequest fallback"),
+        }
+    }
+
+    #[test]
+    fn test_build_goal_proposal_response_accept() {
+        let body = build_goal_proposal_response(Some(GOAL_PROPOSAL_ACCEPT));
+        assert_eq!(body["kind"], "goal_proposal_answer");
+        assert_eq!(body["accepted"], true);
+    }
+
+    #[test]
+    fn test_build_goal_proposal_response_reject() {
+        let body = build_goal_proposal_response(Some(GOAL_PROPOSAL_REJECT));
+        assert_eq!(body["kind"], "goal_proposal_answer");
+        assert_eq!(body["accepted"], false);
+    }
+
+    #[test]
+    fn test_build_goal_proposal_response_none() {
+        let body = build_goal_proposal_response(None);
+        assert_eq!(body["kind"], "goal_proposal_answer");
+        assert_eq!(body["accepted"], false);
     }
 
     #[test]

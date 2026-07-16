@@ -20,7 +20,9 @@ use tracing::{debug, error, info, warn};
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::DaemonHandle;
-use crate::events::{self, AskUserQuestionPayload, EventTranslation, PlanHandoffContext};
+use crate::events::{
+    self, AskUserQuestionPayload, EventTranslation, GoalProposalContext, PlanHandoffContext,
+};
 use crate::history;
 
 /// Shared state across all ACP handlers for one connection.
@@ -2398,6 +2400,22 @@ async fn process_sse_event(
             .await;
             ConsumeOutcome::Continue
         }
+        EventTranslation::GoalProposal {
+            interrogative_id,
+            question,
+            context,
+        } => {
+            handle_goal_proposal(
+                conn,
+                &interrogative_id,
+                &question,
+                &context,
+                base_url,
+                bearer_token,
+            )
+            .await;
+            ConsumeOutcome::Continue
+        }
         EventTranslation::SubagentStarted {
             handle,
             subagent_type,
@@ -2921,6 +2939,98 @@ async fn handle_plan_handoff(
             post_interrogative_response(&base_url, &bearer_token, &interrogative_id, &body).await
         {
             error!(error = %e, "Failed to respond to plan_handoff on daemon");
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+/// Forward a `goal_proposal` interrogative to the ACP client via
+/// `_polytoken/ask_user_question` (single-select: accept/reject) and relay
+/// the answer back to the daemon as a `goal_proposal_answer`.
+///
+/// This mirrors the `handle_plan_handoff` pattern. Falling through to the
+/// generic `handle_interrogative` (which uses `session/request_permission`
+/// with binary allow/reject) causes Paseo to auto-reject in certain modes,
+/// so goal proposals get their own structured forward path.
+async fn handle_goal_proposal(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    question: &str,
+    context: &GoalProposalContext,
+    base_url: &str,
+    bearer_token: &str,
+) {
+    info!(
+        interrogative_id = %interrogative_id,
+        proposed_summary = %context.proposed_summary,
+        "Forwarding goal_proposal to ACP client"
+    );
+
+    tracing::info!(
+        target: "polytoken_acp::conv",
+        interrogative_id = %interrogative_id,
+        "goal_proposal"
+    );
+
+    let payload = events::build_goal_proposal_payload(question, context);
+    let request_json = serde_json::json!({
+        "interrogative_id": interrogative_id,
+        "questions": payload.questions,
+    });
+
+    let params = match serde_json::value::RawValue::from_string(request_json.to_string()) {
+        Ok(raw) => std::sync::Arc::from(raw),
+        Err(e) => {
+            error!(error = %e, "Failed to serialize goal_proposal params");
+            let _ = cancel_interrogative(base_url, bearer_token, interrogative_id).await;
+            return;
+        }
+    };
+
+    let ext_request = acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(
+        "_polytoken/ask_user_question",
+        params,
+    ));
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+
+    let sent = conn.send_request(ext_request);
+    sent.on_receiving_result(async move |result| {
+        let body = match result {
+            Ok(response_value) => {
+                let (selected, _free_text) = parse_plan_handoff_answer(&response_value);
+                events::build_goal_proposal_response(selected.as_deref())
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    interrogative_id = %interrogative_id,
+                    "ACP client does not support goal_proposal choice or request failed; cancelling"
+                );
+                serde_json::json!({ "kind": "cancel" })
+            }
+        };
+
+        info!(
+            interrogative_id = %interrogative_id,
+            accepted = ?body.get("accepted"),
+            "goal_proposal response from client"
+        );
+        tracing::info!(
+            target: "polytoken_acp::conv",
+            interrogative_id = %interrogative_id,
+            accepted = ?body.get("accepted"),
+            "goal_proposal_response"
+        );
+
+        if let Err(e) =
+            post_interrogative_response(&base_url, &bearer_token, &interrogative_id, &body).await
+        {
+            error!(error = %e, "Failed to respond to goal_proposal on daemon");
         }
 
         Ok(())
