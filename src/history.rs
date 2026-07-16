@@ -56,17 +56,69 @@ pub fn translate_history_item(item: &serde_json::Value) -> Vec<acp::SessionUpdat
     updates
 }
 
+/// History item types that mark a context boundary.
+///
+/// When the daemon compacts or clears context, everything before this boundary
+/// has been summarized or discarded from the LLM's active context. Replaying
+/// pre-boundary items to the client would "munge" multiple separate conversation
+/// contexts into one continuous timeline.
+const CONTEXT_BOUNDARY_TYPES: &[&str] = &["context_cleared", "compaction_fencepost"];
+
+/// Find the index of the *last* context boundary in the items slice.
+///
+/// Returns `Some(index)` of the last item whose `type` is a context boundary
+/// (`context_cleared` or `compaction_fencepost`), or `None` if there is none.
+/// The caller should replay only items **after** this index.
+fn last_context_boundary(items: &[serde_json::Value]) -> Option<usize> {
+    items.iter().rposition(|item| {
+        item.get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| CONTEXT_BOUNDARY_TYPES.contains(&t))
+    })
+}
+
 /// Translate a list of history items into ACP session notifications.
 ///
 /// Each `SessionUpdate` is wrapped in a `SessionNotification` with the given
 /// session ID, ready to be sent to the client.
+///
+/// If the history contains one or more context boundaries (`context_cleared`
+/// or `compaction_fencepost`), only items **after the last boundary** are
+/// translated. Items before the boundary belong to a prior conversation context
+/// that has been compacted or cleared; replaying them would merge disjoint
+/// conversations into a single timeline.
 pub fn translate_history_to_notifications(
     items: &[serde_json::Value],
     session_id: &str,
 ) -> Vec<acp::SessionNotification> {
     let sid = acp::SessionId::new(session_id.to_string());
+
+    // Truncate at the last context boundary so we only replay the current
+    // active context, not compacted/cleared prior contexts.
+    let replay_items = match last_context_boundary(items) {
+        Some(boundary_idx) => {
+            let start = boundary_idx + 1;
+            if start >= items.len() {
+                debug!(
+                    boundary_at = boundary_idx,
+                    total_items = items.len(),
+                    "Context boundary is last item; nothing to replay"
+                );
+                return Vec::new();
+            }
+            debug!(
+                boundary_at = boundary_idx,
+                items_before = boundary_idx + 1,
+                items_after = items.len() - start,
+                "Truncating history at last context boundary"
+            );
+            &items[start..]
+        }
+        None => items,
+    };
+
     let mut notifications = Vec::new();
-    for item in items {
+    for item in replay_items {
         let updates = translate_history_item(item);
         for update in updates {
             notifications.push(acp::SessionNotification::new(sid.clone(), update));
@@ -385,5 +437,100 @@ mod tests {
                 updates.len()
             );
         }
+    }
+
+    // --- Context boundary tests ---
+
+    #[test]
+    fn test_no_boundary_replays_all() {
+        // No context_cleared or compaction_fencepost → all items replayed.
+        let items = vec![
+            serde_json::json!({"type": "user", "content": "Hello", "prompt_id": "p1"}),
+            serde_json::json!({"type": "assistant", "blocks": [{"type": "text", "text": "Hi"}], "prompt_id": "p1"}),
+            serde_json::json!({"type": "user", "content": "Bye", "prompt_id": "p2"}),
+        ];
+        let notifications = translate_history_to_notifications(&items, "test-session");
+        // 2 user messages + 1 assistant message = 3 notifications
+        assert_eq!(notifications.len(), 3);
+    }
+
+    #[test]
+    fn test_context_cleared_truncates() {
+        // context_cleared at index 2 → only items after index 2 replayed.
+        let items = vec![
+            serde_json::json!({"type": "user", "content": "old 1", "prompt_id": "p1"}),
+            serde_json::json!({"type": "assistant", "blocks": [{"type": "text", "text": "old reply"}], "prompt_id": "p1"}),
+            serde_json::json!({"type": "context_cleared", "facet": "execute"}),
+            serde_json::json!({"type": "user", "content": "new 1", "prompt_id": "p2"}),
+            serde_json::json!({"type": "assistant", "blocks": [{"type": "text", "text": "new reply"}], "prompt_id": "p2"}),
+        ];
+        let notifications = translate_history_to_notifications(&items, "test-session");
+        // Only 2 items after boundary: 1 user + 1 assistant
+        assert_eq!(notifications.len(), 2);
+    }
+
+    #[test]
+    fn test_compaction_fencepost_truncates() {
+        // compaction_fencepost at index 1 → only items after index 1 replayed.
+        let items = vec![
+            serde_json::json!({"type": "user", "content": "compacted msg", "prompt_id": "p1"}),
+            serde_json::json!({"type": "compaction_fencepost", "compaction_id": "c1", "summary": "...", "reattachment": {}}),
+            serde_json::json!({"type": "user", "content": "post-compaction", "prompt_id": "p2"}),
+        ];
+        let notifications = translate_history_to_notifications(&items, "test-session");
+        // Only 1 user item after boundary
+        assert_eq!(notifications.len(), 1);
+    }
+
+    #[test]
+    fn test_last_boundary_wins() {
+        // Multiple boundaries → only items after the *last* one replayed.
+        let items = vec![
+            serde_json::json!({"type": "user", "content": "very old", "prompt_id": "p1"}),
+            serde_json::json!({"type": "context_cleared", "facet": "plan"}),
+            serde_json::json!({"type": "user", "content": "old", "prompt_id": "p2"}),
+            serde_json::json!({"type": "compaction_fencepost", "compaction_id": "c1", "summary": "...", "reattachment": {}}),
+            serde_json::json!({"type": "user", "content": "new", "prompt_id": "p3"}),
+        ];
+        let notifications = translate_history_to_notifications(&items, "test-session");
+        // Only 1 user item after the last boundary (compaction_fencepost at index 3)
+        assert_eq!(notifications.len(), 1);
+    }
+
+    #[test]
+    fn test_boundary_is_last_item() {
+        // Boundary is the very last item → nothing to replay.
+        let items = vec![
+            serde_json::json!({"type": "user", "content": "msg", "prompt_id": "p1"}),
+            serde_json::json!({"type": "context_cleared", "facet": "execute"}),
+        ];
+        let notifications = translate_history_to_notifications(&items, "test-session");
+        assert!(notifications.is_empty());
+    }
+
+    #[test]
+    fn test_empty_items() {
+        let notifications = translate_history_to_notifications(&[], "test-session");
+        assert!(notifications.is_empty());
+    }
+
+    #[test]
+    fn test_last_context_boundary_finds_correct_index() {
+        let items = vec![
+            serde_json::json!({"type": "user", "content": "a"}),
+            serde_json::json!({"type": "context_cleared", "facet": "execute"}),
+            serde_json::json!({"type": "user", "content": "b"}),
+            serde_json::json!({"type": "user", "content": "c"}),
+        ];
+        assert_eq!(last_context_boundary(&items), Some(1));
+    }
+
+    #[test]
+    fn test_last_context_boundary_none() {
+        let items = vec![
+            serde_json::json!({"type": "user", "content": "a"}),
+            serde_json::json!({"type": "assistant", "blocks": [{"type": "text", "text": "b"}]}),
+        ];
+        assert_eq!(last_context_boundary(&items), None);
     }
 }
