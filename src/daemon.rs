@@ -95,10 +95,25 @@ impl DaemonHandle {
         let log_dir = temp_dir.join("logs");
         let cred_path = temp_dir.join("credential.json");
 
-        // Use polytoken's default persistent sessions directory (~/.local/share/polytoken/sessions/)
-        // so that session history survives process restarts and can be resumed later.
-        // Previously this used a temp dir which got cleaned up by the OS, breaking resume.
-        let sessions_dir = default_sessions_dir();
+        // Use a dedicated ACP sessions directory (~/.local/share/polytoken/sessions-acp/)
+        // instead of the default `~/.local/share/polytoken/sessions/`.
+        //
+        // WHY: The polytoken TUI (`polytoken attach`, `polytoken sessions`,
+        // `polytoken continue`) discovers live and resumable sessions by scanning
+        // the default sessions directory. If the ACP-managed daemon were registered
+        // there, a user could attach a TUI to the same daemon that this shim is
+        // driving. When the ACP connection ends (Paseo window closed, stdin EOF,
+        // or process exit), the cleanup code in `run()` terminates the daemon —
+        // which would kill the TUI's SSE stream with confusing "SSE errors"
+        // instead of a clear "session not found."
+        //
+        // Using a separate directory makes ACP sessions invisible to TUI
+        // tooling: `polytoken sessions` won't list them, `polytoken attach
+        // <id>` won't find them, and `polytoken continue` will resume from its
+        // own separate history (spawning its own daemon if needed). ACP resume
+        // still works because `session/load` always passes `--sessions-dir` to
+        // point at this directory, so `--resume` finds the saved `log.jsonl`.
+        let sessions_dir = acp_sessions_dir();
 
         // Create temp dir with 0700 permissions (polytoken requires it)
         std::fs::create_dir_all(&temp_dir).context("Failed to create temp dir")?;
@@ -575,12 +590,18 @@ async fn poll_startup(startup_path: &Path) -> Result<u16> {
     }
 }
 
-/// Returns polytoken's default persistent sessions directory.
+/// Returns the ACP-specific persistent sessions directory.
 ///
-/// This is `~/.local/share/polytoken/sessions/` (XDG_DATA_HOME fallback).
-/// Using the default ensures session history survives across polytoken-acp
-/// process restarts so that `--resume` can find the saved `log.jsonl`.
-fn default_sessions_dir() -> PathBuf {
+/// This is `~/.local/share/polytoken/sessions-acp/` (XDG_DATA_HOME fallback).
+///
+/// This is deliberately **separate** from the default `sessions/` directory
+/// used by the polytoken TUI, so that ACP-managed daemons are invisible to
+/// `polytoken attach`, `polytoken sessions`, and `polytoken continue`. See the
+/// comment at the call site in `spawn_with_session_id` for the full rationale.
+///
+/// Session history still survives across polytoken-acp process restarts here
+/// so that `--resume` can find the saved `log.jsonl`.
+fn acp_sessions_dir() -> PathBuf {
     let data_dir = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -588,7 +609,7 @@ fn default_sessions_dir() -> PathBuf {
                 .map(|h| PathBuf::from(h).join(".local").join("share"))
                 .unwrap_or_else(|_| PathBuf::from("~/.local/share"))
         });
-    data_dir.join("polytoken").join("sessions")
+    data_dir.join("polytoken").join("sessions-acp")
 }
 
 /// Generate a session ID in polytoken's required format:
