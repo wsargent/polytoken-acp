@@ -37,12 +37,96 @@ struct AgentState {
     /// `handle_cancel` triggers these to proactively unblock the `SseConsumer`
     /// even when the daemon never emits a `TurnCancelled` SSE event.
     cancel_tokens: HashMap<String, CancellationToken>,
-    /// Client capabilities captured from the ACP `initialize` handshake.
-    /// `None` until `initialize` is received; `Some(capabilities)` after.
-    /// Used to decide whether to use native `session/elicitation` for
-    /// `ask_user_question` (when the client advertises form support) or
-    /// fall back to the ext-method + text fallback path.
-    client_capabilities: Option<acp::ClientCapabilities>,
+    /// Client feature support captured from the ACP `initialize` handshake.
+    /// `None` until `initialize` is received; `Some(features)` after.
+    /// Tracks which `_polytoken/*` ext methods/notifications the client
+    /// handles, so each delivery site can check before sending and fall
+    /// back to a standard ACP equivalent or text rendering when unsupported.
+    client_features: Option<ClientFeatureSupport>,
+}
+
+/// Which `_polytoken/*` extension methods a client supports.
+///
+/// Populated once at `initialize` from:
+/// - Formal `ClientCapabilities` (elicitation)
+/// - `_meta.polytoken.supported_methods` advertisement
+///
+/// When a client does not advertise `supported_methods`, all ext-method
+/// flags default to `true` (optimistic): notifications are silently
+/// dropped by the ACP SDK if unhandled, and ext requests use error-catch
+/// fallbacks. Clients that want precise control advertise their support.
+#[derive(Clone, Debug)]
+struct ClientFeatureSupport {
+    /// Whether the client can render a `session/elicitation` form
+    /// (single-select enum, multi-select, etc.).
+    supports_elicitation: bool,
+    /// Whether the client handles `_polytoken/subagent_started` and
+    /// `_polytoken/subagent_completed` notifications.
+    supports_subagent_events: bool,
+    /// Whether the client handles `_polytoken/system_reminder` notifications.
+    supports_system_reminder: bool,
+    /// Whether the client handles `_polytoken/job_*` notifications.
+    supports_job_events: bool,
+    /// Whether the client handles `_polytoken/ask_user_question` ext requests
+    /// (the rich overlay for asking structured questions).
+    supports_ask_user_question_overlay: bool,
+}
+
+impl Default for ClientFeatureSupport {
+    /// Default is optimistic: all ext methods assumed supported (they're
+    /// silently dropped by the ACP SDK if unhandled). Elicitation defaults
+    /// to `false` since it requires explicit formal capability advertisement.
+    fn default() -> Self {
+        Self {
+            supports_elicitation: false,
+            supports_subagent_events: true,
+            supports_system_reminder: true,
+            supports_job_events: true,
+            supports_ask_user_question_overlay: true,
+        }
+    }
+}
+
+impl ClientFeatureSupport {
+    /// Build from the client's `initialize` request.
+    fn from_initialize(caps: &acp::ClientCapabilities, meta: &Option<acp::Meta>) -> Self {
+        let supports_elicitation = caps
+            .elicitation
+            .as_ref()
+            .and_then(|e| e.form.as_ref())
+            .is_some();
+
+        // Check _meta.polytoken.supported_methods for custom ext method support.
+        // When absent (not advertised), default to optimistic (true) for all ext
+        // methods — notifications are silently dropped if unhandled, and ext
+        // requests have error-catch fallbacks.
+        let supported_methods = meta
+            .as_ref()
+            .and_then(|m| m.get("polytoken"))
+            .and_then(|p| p.get("supported_methods"))
+            .and_then(|sm| sm.as_array());
+
+        match supported_methods {
+            Some(methods) => {
+                let has = |name: &str| methods.iter().any(|m| m.as_str() == Some(name));
+                Self {
+                    supports_elicitation,
+                    supports_subagent_events: has("subagent_started") || has("subagent_completed"),
+                    supports_system_reminder: has("system_reminder"),
+                    supports_job_events: has("job_promoted")
+                        || has("job_completed")
+                        || has("job_expiring")
+                        || has("job_cancelled")
+                        || has("job_updated"),
+                    supports_ask_user_question_overlay: has("ask_user_question"),
+                }
+            }
+            None => Self {
+                supports_elicitation,
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// A queued prompt awaiting execution by the per-session processor task.
@@ -55,8 +139,8 @@ struct PromptQueueItem {
     cwd: std::path::PathBuf,
     responder: agent_client_protocol::Responder<acp::PromptResponse>,
     conn: ConnectionTo<Client>,
-    /// Whether the client advertised form-based elicitation support.
-    supports_elicitation: bool,
+    /// Client feature support captured from the `initialize` handshake.
+    client_features: ClientFeatureSupport,
 }
 
 impl AgentState {
@@ -65,7 +149,7 @@ impl AgentState {
             sessions: HashMap::new(),
             prompt_queues: HashMap::new(),
             cancel_tokens: HashMap::new(),
-            client_capabilities: None,
+            client_features: None,
         }
     }
 
@@ -97,11 +181,14 @@ pub async fn run() {
                 async move |req: acp::InitializeRequest, responder, _cx| {
                     info!("ACP initialize from client");
 
-                    // Capture client capabilities for later use (elicitation
+                    // Capture client feature support for later use (elicitation
                     // negotiation, ext-method support checks, etc.).
                     {
                         let mut s = state.lock().unwrap();
-                        s.client_capabilities = Some(req.client_capabilities.clone());
+                        s.client_features = Some(ClientFeatureSupport::from_initialize(
+                            &req.client_capabilities,
+                            &req.meta,
+                        ));
                     }
 
                     let mut ext_meta = serde_json::Map::new();
@@ -877,7 +964,7 @@ async fn handle_prompt(
     );
 
     // Collect connection info and prompt-queue sender without holding lock across await
-    let (events_url, bearer_token, base_url, cwd, queue_sender, supports_elicitation) = {
+    let (events_url, bearer_token, base_url, cwd, queue_sender, client_features) = {
         let sessions = state.lock().unwrap();
         let daemon = match sessions.sessions.get(&session_id) {
             Some(d) => d,
@@ -891,17 +978,16 @@ async fn handle_prompt(
             }
         };
         let sender = sessions.prompt_queues.get(&session_id).cloned();
-        // Check whether the client advertised form-based elicitation support
-        // in its initialize capabilities. If so, ask_user_question will be
-        // sent as a native session/elicitation request (clickable form).
-        let supports_elicitation = client_supports_elicitation(&sessions.client_capabilities);
+        // Extract the client feature support captured at initialize.
+        // Determines which ext methods/notifications to send.
+        let client_features = sessions.client_features.clone().unwrap_or_default();
         (
             daemon.events_url(),
             daemon.bearer_token().to_string(),
             daemon.base_url().to_string(),
             daemon.cwd().to_path_buf(),
             sender,
-            supports_elicitation,
+            client_features,
         )
     };
 
@@ -932,7 +1018,7 @@ async fn handle_prompt(
         cwd,
         responder,
         conn: cx.clone(),
-        supports_elicitation,
+        client_features,
     };
 
     match queue_sender.try_send(item) {
@@ -1048,7 +1134,7 @@ async fn run_prompt_turn(item: PromptQueueItem, cancel_token: CancellationToken)
         base_url: item.base_url,
         cwd: item.cwd,
         responder: item.responder,
-        supports_elicitation: item.supports_elicitation,
+        client_features: item.client_features,
     };
 
     // Await the SSE consumer to completion (do NOT spawn — the processor
@@ -2112,11 +2198,10 @@ struct SseConsumer {
     base_url: String,
     cwd: std::path::PathBuf,
     responder: agent_client_protocol::Responder<acp::PromptResponse>,
-    /// Whether the client advertised form-based elicitation support in its
-    /// `initialize` capabilities. When `true`, `ask_user_question` is sent
-    /// as a native ACP `session/elicitation` request (clickable form).
-    /// When `false`, falls back to the ext method + text fallback path.
-    supports_elicitation: bool,
+    /// Client feature support captured from the `initialize` handshake.
+    /// Determines which ext methods/notifications to send and which to
+    /// skip or fall back to standard ACP equivalents.
+    client_features: ClientFeatureSupport,
 }
 
 impl SseConsumer {
@@ -2134,7 +2219,7 @@ impl SseConsumer {
         let bearer_token = self.bearer_token;
         let base_url = self.base_url;
         let cwd = self.cwd;
-        let supports_elicitation = self.supports_elicitation;
+        let client_features = self.client_features;
         let mut responder = Some(self.responder);
 
         loop {
@@ -2152,7 +2237,7 @@ impl SseConsumer {
                     &session_id,
                     &cwd,
                     &conn,
-                    supports_elicitation,
+                    &client_features,
                 ) => result,
                 _ = cancel_token.cancelled() => {
                     info!(
@@ -2246,7 +2331,7 @@ async fn connect_and_consume(
     session_id: &str,
     cwd: &std::path::Path,
     conn: &ConnectionTo<Client>,
-    supports_elicitation: bool,
+    client_features: &ClientFeatureSupport,
 ) -> ConsumeOutcome {
     let client = reqwest::Client::new();
     let response = client
@@ -2297,7 +2382,7 @@ async fn connect_and_consume(
                 cwd,
                 &mut cached_facets,
                 conn,
-                supports_elicitation,
+                client_features,
             )
             .await
             {
@@ -2324,7 +2409,7 @@ async fn process_sse_event(
     cwd: &std::path::Path,
     cached_facets: &mut Option<Vec<String>>,
     conn: &ConnectionTo<Client>,
-    supports_elicitation: bool,
+    client_features: &ClientFeatureSupport,
 ) -> ConsumeOutcome {
     let event = match events::parse_sse_event(data) {
         Some(e) => e,
@@ -2425,7 +2510,7 @@ async fn process_sse_event(
                 session_id,
                 base_url,
                 bearer_token,
-                supports_elicitation,
+                client_features,
             )
             .await;
             ConsumeOutcome::Continue
@@ -2459,7 +2544,7 @@ async fn process_sse_event(
                 session_id,
                 base_url,
                 bearer_token,
-                supports_elicitation,
+                client_features,
             )
             .await;
             ConsumeOutcome::Continue
@@ -2481,12 +2566,14 @@ async fn process_sse_event(
             }
 
             // 2. Send extension notification with full metadata (model, type).
-            let params = serde_json::json!({
-                "handle": handle,
-                "subagent_type": subagent_type,
-                "model": model,
-            });
-            send_ext_notification(conn, "_polytoken/subagent_started", &params);
+            if client_features.supports_subagent_events {
+                let params = serde_json::json!({
+                    "handle": handle,
+                    "subagent_type": subagent_type,
+                    "model": model,
+                });
+                send_ext_notification(conn, "_polytoken/subagent_started", &params);
+            }
 
             ConsumeOutcome::Continue
         }
@@ -2512,13 +2599,15 @@ async fn process_sse_event(
             }
 
             // 2. Send extension notification with full metadata.
-            let params = serde_json::json!({
-                "handle": handle,
-                "result_summary": result_summary,
-                "outcome_kind": outcome_kind,
-                "outcome_message": outcome_message,
-            });
-            send_ext_notification(conn, "_polytoken/subagent_completed", &params);
+            if client_features.supports_subagent_events {
+                let params = serde_json::json!({
+                    "handle": handle,
+                    "result_summary": result_summary,
+                    "outcome_kind": outcome_kind,
+                    "outcome_message": outcome_message,
+                });
+                send_ext_notification(conn, "_polytoken/subagent_completed", &params);
+            }
 
             ConsumeOutcome::Continue
         }
@@ -2530,19 +2619,26 @@ async fn process_sse_event(
         } => {
             // Shell job events (subagent jobs are filtered out in translate_job_event).
             // Send extension notification with the event data.
-            let method = format!("_polytoken/{}", event_type);
-            let params = match exit_code {
-                Some(code) => serde_json::json!({
-                    "job_id": job_id,
-                    "exit_code": code,
-                    "subagent_handle": null,
-                }),
-                None => serde_json::json!({
-                    "job_id": job_id,
-                    "subagent_handle": null,
-                }),
-            };
-            send_ext_notification(conn, &method, &params);
+            if client_features.supports_job_events {
+                let method = format!("_polytoken/{}", event_type);
+                let params = match exit_code {
+                    Some(code) => serde_json::json!({
+                        "job_id": job_id,
+                        "exit_code": code,
+                        "subagent_handle": null,
+                    }),
+                    None => serde_json::json!({
+                        "job_id": job_id,
+                        "subagent_handle": null,
+                    }),
+                };
+                send_ext_notification(conn, &method, &params);
+            } else {
+                debug!(
+                    event_type = %event_type,
+                    "Skipping job event notification — client does not support job events"
+                );
+            }
             ConsumeOutcome::Continue
         }
         EventTranslation::SystemReminder {
@@ -2551,13 +2647,20 @@ async fn process_sse_event(
             body,
             reason,
         } => {
-            let params = serde_json::json!({
-                "slug": slug,
-                "display_name": display_name,
-                "body": body,
-                "reason": reason,
-            });
-            send_ext_notification(conn, "_polytoken/system_reminder", &params);
+            if client_features.supports_system_reminder {
+                let params = serde_json::json!({
+                    "slug": slug,
+                    "display_name": display_name,
+                    "body": body,
+                    "reason": reason,
+                });
+                send_ext_notification(conn, "_polytoken/system_reminder", &params);
+            } else {
+                debug!(
+                    slug = %slug,
+                    "Skipping system_reminder notification — client does not support it"
+                );
+            }
             ConsumeOutcome::Continue
         }
         EventTranslation::GoalDriverUpdate {
@@ -2812,16 +2915,6 @@ fn send_ext_notification(conn: &ConnectionTo<Client>, method: &str, params: &ser
     // Extension notifications are fire-and-forget. If the client doesn't
     // recognize the method it silently ignores it (per the ACP spec).
     let _ = conn.send_request(ext_notif);
-}
-
-/// Check whether the client's `initialize` capabilities advertise form-based
-/// elicitation support. Returns `true` only when the client can render a
-/// `session/elicitation` form (single-select enum, multi-select, etc.).
-fn client_supports_elicitation(caps: &Option<acp::ClientCapabilities>) -> bool {
-    caps.as_ref()
-        .and_then(|c| c.elicitation.as_ref())
-        .and_then(|e| e.form.as_ref())
-        .is_some()
 }
 
 /// Map a single Polytoken `ask_user_question` item to an ACP elicitation
@@ -3087,12 +3180,12 @@ async fn handle_ask_user_question(
     session_id: &str,
     base_url: &str,
     bearer_token: &str,
-    supports_elicitation: bool,
+    client_features: &ClientFeatureSupport,
 ) {
     info!(
         interrogative_id = %interrogative_id,
         question_count = payload.questions.len(),
-        supports_elicitation = supports_elicitation,
+        supports_elicitation = client_features.supports_elicitation,
         "Forwarding ask_user_question to ACP client"
     );
 
@@ -3100,7 +3193,7 @@ async fn handle_ask_user_question(
         target: "polytoken_acp::conv",
         interrogative_id = %interrogative_id,
         question_count = payload.questions.len(),
-        supports_elicitation = supports_elicitation,
+        supports_elicitation = client_features.supports_elicitation,
         "ask_user_question"
     );
 
@@ -3108,7 +3201,7 @@ async fn handle_ask_user_question(
     // initialize, use the standardized `session/elicitation` request.
     // This renders as a proper form with clickable options (single-select
     // enum / multi-select) in capable clients — better UX than text.
-    if supports_elicitation {
+    if client_features.supports_elicitation {
         handle_ask_user_question_elicitation(
             conn,
             interrogative_id,
@@ -3121,7 +3214,21 @@ async fn handle_ask_user_question(
         return;
     }
 
-    // Otherwise, fall back to the _polytoken/ask_user_question ext method,
+    // Otherwise, fall back to the _polytoken/ask_user_question ext method.
+    // If the client doesn't support it, go straight to the text fallback so
+    // the user still sees the question instead of a silent cancel.
+
+    if !client_features.supports_ask_user_question_overlay {
+        debug!(
+            interrogative_id = %interrogative_id,
+            "Client does not support ask_user_question overlay; using text fallback"
+        );
+        let sid = acp::SessionId::new(session_id.to_string());
+        let payload_clone = payload.clone();
+        send_question_text_fallback(conn, &sid, &payload_clone);
+        let _ = cancel_interrogative(base_url, bearer_token, interrogative_id).await;
+        return;
+    }
 
     let request_json = serde_json::json!({
         "interrogative_id": interrogative_id,
@@ -3306,12 +3413,12 @@ async fn handle_goal_proposal(
     session_id: &str,
     base_url: &str,
     bearer_token: &str,
-    supports_elicitation: bool,
+    client_features: &ClientFeatureSupport,
 ) {
     info!(
         interrogative_id = %interrogative_id,
         proposed_summary = %context.proposed_summary,
-        supports_elicitation = supports_elicitation,
+        supports_elicitation = client_features.supports_elicitation,
         "Forwarding goal_proposal to ACP client"
     );
 
@@ -3324,7 +3431,7 @@ async fn handle_goal_proposal(
     let payload = events::build_goal_proposal_payload(question, context);
 
     // --- Strategy 1: native session/elicitation (Paseo-compatible) -----------
-    if supports_elicitation {
+    if client_features.supports_elicitation {
         handle_goal_proposal_elicitation(
             conn,
             interrogative_id,
@@ -4544,5 +4651,110 @@ mod tests {
 
         assert_eq!(result, "done");
         assert!(!token.is_cancelled());
+    }
+
+    // ----- ClientFeatureSupport tests -----
+
+    #[test]
+    fn test_client_feature_support_full_meta_advertisement() {
+        let caps = acp::ClientCapabilities::default();
+        let mut meta_map = serde_json::Map::new();
+        meta_map.insert(
+            "polytoken".to_string(),
+            serde_json::json!({
+                "supported_methods": [
+                    "ask_user_question",
+                    "subagent_started",
+                    "subagent_completed",
+                    "system_reminder",
+                    "job_promoted",
+                    "job_completed",
+                    "job_expiring",
+                    "job_cancelled",
+                    "job_updated",
+                ]
+            }),
+        );
+        let meta: Option<acp::Meta> = Some(meta_map);
+
+        let features = ClientFeatureSupport::from_initialize(&caps, &meta);
+
+        assert!(!features.supports_elicitation, "no formal elicitation cap");
+        assert!(features.supports_subagent_events);
+        assert!(features.supports_system_reminder);
+        assert!(features.supports_job_events);
+        assert!(features.supports_ask_user_question_overlay);
+    }
+
+    #[test]
+    fn test_client_feature_support_partial_meta_advertisement() {
+        let caps = acp::ClientCapabilities::default();
+        let mut meta_map = serde_json::Map::new();
+        meta_map.insert(
+            "polytoken".to_string(),
+            serde_json::json!({
+                "supported_methods": ["system_reminder"]
+            }),
+        );
+        let meta: Option<acp::Meta> = Some(meta_map);
+
+        let features = ClientFeatureSupport::from_initialize(&caps, &meta);
+
+        assert!(!features.supports_subagent_events);
+        assert!(features.supports_system_reminder);
+        assert!(!features.supports_job_events);
+        assert!(!features.supports_ask_user_question_overlay);
+    }
+
+    #[test]
+    fn test_client_feature_support_elicitation_from_formal_caps() {
+        // Simulate a client that advertises formal elicitation form support.
+        let caps = acp::ClientCapabilities::default().elicitation(
+            acp::ElicitationCapabilities::new().form(acp::ElicitationFormCapabilities::new()),
+        );
+        let meta: Option<acp::Meta> = None;
+
+        let features = ClientFeatureSupport::from_initialize(&caps, &meta);
+
+        assert!(features.supports_elicitation);
+        // No supported_methods advertised → optimistic defaults.
+        assert!(features.supports_subagent_events);
+        assert!(features.supports_system_reminder);
+        assert!(features.supports_job_events);
+        assert!(features.supports_ask_user_question_overlay);
+    }
+
+    #[test]
+    fn test_client_feature_support_no_meta_optimistic_defaults() {
+        let caps = acp::ClientCapabilities::default();
+        let meta: Option<acp::Meta> = None;
+
+        let features = ClientFeatureSupport::from_initialize(&caps, &meta);
+
+        // No formal caps, no _meta → elicitation false, ext methods optimistic.
+        assert!(!features.supports_elicitation);
+        assert!(features.supports_subagent_events);
+        assert!(features.supports_system_reminder);
+        assert!(features.supports_job_events);
+        assert!(features.supports_ask_user_question_overlay);
+    }
+
+    #[test]
+    fn test_client_feature_support_empty_supported_methods() {
+        let caps = acp::ClientCapabilities::default();
+        let mut meta_map = serde_json::Map::new();
+        meta_map.insert(
+            "polytoken".to_string(),
+            serde_json::json!({"supported_methods": []}),
+        );
+        let meta: Option<acp::Meta> = Some(meta_map);
+
+        let features = ClientFeatureSupport::from_initialize(&caps, &meta);
+
+        // Empty array means client explicitly supports nothing.
+        assert!(!features.supports_subagent_events);
+        assert!(!features.supports_system_reminder);
+        assert!(!features.supports_job_events);
+        assert!(!features.supports_ask_user_question_overlay);
     }
 }
