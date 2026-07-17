@@ -20,7 +20,9 @@ use tracing::{debug, error, info, warn};
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::DaemonHandle;
-use crate::events::{self, AskUserQuestionPayload, EventTranslation, PlanHandoffContext};
+use crate::events::{
+    self, AskUserQuestionPayload, EventTranslation, GoalProposalContext, PlanHandoffContext,
+};
 use crate::history;
 
 /// Shared state across all ACP handlers for one connection.
@@ -2444,6 +2446,24 @@ async fn process_sse_event(
             .await;
             ConsumeOutcome::Continue
         }
+        EventTranslation::GoalProposal {
+            interrogative_id,
+            question,
+            context,
+        } => {
+            handle_goal_proposal(
+                conn,
+                &interrogative_id,
+                &question,
+                &context,
+                session_id,
+                base_url,
+                bearer_token,
+                supports_elicitation,
+            )
+            .await;
+            ConsumeOutcome::Continue
+        }
         EventTranslation::SubagentStarted {
             handle,
             subagent_type,
@@ -3260,6 +3280,243 @@ async fn handle_plan_handoff(
             post_interrogative_response(&base_url, &bearer_token, &interrogative_id, &body).await
         {
             error!(error = %e, "Failed to respond to plan_handoff on daemon");
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+/// Forward a `goal_proposal` interrogative to the ACP client, then relay the
+/// operator's accept/reject decision back to the daemon as a
+/// `goal_proposal_answer`.
+///
+/// Mirrors the layered strategy from `handle_ask_user_question` (PR #58):
+/// 1. **Prefer native `session/elicitation`** when the client advertised
+///    form support — renders a clickable form in Paseo.
+/// 2. **Fall back to the `_polytoken/ask_user_question` ext method** when
+///    elicitation is unavailable, with a text fallback on failure so the
+///    operator still sees the proposal instead of a silent cancel.
+#[allow(clippy::too_many_arguments)]
+async fn handle_goal_proposal(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    question: &str,
+    context: &GoalProposalContext,
+    session_id: &str,
+    base_url: &str,
+    bearer_token: &str,
+    supports_elicitation: bool,
+) {
+    info!(
+        interrogative_id = %interrogative_id,
+        proposed_summary = %context.proposed_summary,
+        supports_elicitation = supports_elicitation,
+        "Forwarding goal_proposal to ACP client"
+    );
+
+    tracing::info!(
+        target: "polytoken_acp::conv",
+        interrogative_id = %interrogative_id,
+        "goal_proposal"
+    );
+
+    let payload = events::build_goal_proposal_payload(question, context);
+
+    // --- Strategy 1: native session/elicitation (Paseo-compatible) -----------
+    if supports_elicitation {
+        handle_goal_proposal_elicitation(
+            conn,
+            interrogative_id,
+            &payload,
+            session_id,
+            base_url,
+            bearer_token,
+        )
+        .await;
+        return;
+    }
+
+    // --- Strategy 2: ext-method with text fallback -------------------------
+    let request_json = serde_json::json!({
+        "interrogative_id": interrogative_id,
+        "questions": payload.questions,
+    });
+
+    let params = match serde_json::value::RawValue::from_string(request_json.to_string()) {
+        Ok(raw) => std::sync::Arc::from(raw),
+        Err(e) => {
+            error!(error = %e, "Failed to serialize goal_proposal params");
+            let _ = cancel_interrogative(base_url, bearer_token, interrogative_id).await;
+            return;
+        }
+    };
+
+    let ext_request = acp::AgentRequest::ExtMethodRequest(acp::ExtRequest::new(
+        "_polytoken/ask_user_question",
+        params,
+    ));
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+    let session_id = acp::SessionId::new(session_id.to_string());
+    let conn_clone = conn.clone();
+    let payload_clone = payload.clone();
+
+    let sent = conn.send_request(ext_request);
+    sent.on_receiving_result(async move |result| {
+        match result {
+            Ok(response_value) => {
+                let (selected, _) = parse_plan_handoff_answer(&response_value);
+                let body = events::build_goal_proposal_response(selected.as_deref());
+
+                info!(
+                    interrogative_id = %interrogative_id,
+                    accepted = ?body.get("accepted"),
+                    "goal_proposal response from client"
+                );
+                tracing::info!(
+                    target: "polytoken_acp::conv",
+                    interrogative_id = %interrogative_id,
+                    accepted = ?body.get("accepted"),
+                    "goal_proposal_response"
+                );
+
+                if let Err(e) =
+                    post_interrogative_response(&base_url, &bearer_token, &interrogative_id, &body)
+                        .await
+                {
+                    error!(error = %e, "Failed to respond to goal_proposal on daemon");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    interrogative_id = %interrogative_id,
+                    "ACP client does not support goal_proposal or request failed; sending text fallback then cancelling"
+                );
+                // Show the proposal as visible text so the operator at least
+                // sees what was being asked, then cancel the interrogative.
+                send_question_text_fallback(&conn_clone, &session_id, &payload_clone);
+                let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id).await;
+            }
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+/// Send a goal proposal as a native ACP `session/elicitation` request. The
+/// client renders a clickable form; the selected value is mapped to the
+/// daemon's `goal_proposal_answer`. On decline/cancel/error, a text fallback
+/// is shown before cancelling the interrogative.
+async fn handle_goal_proposal_elicitation(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    payload: &AskUserQuestionPayload,
+    session_id: &str,
+    base_url: &str,
+    bearer_token: &str,
+) {
+    let q = &payload.questions[0];
+    let message = match &q.context {
+        Some(ctx) => format!("{}\n\n{}", ctx, q.question),
+        None => q.question.clone(),
+    };
+
+    let (field_name, prop_schema, required) = build_elicitation_schema_for_question(q);
+    let schema = acp::ElicitationSchema::new().property(field_name, prop_schema, required);
+
+    let session_scope =
+        acp::ElicitationSessionScope::new(acp::SessionId::new(session_id.to_string()));
+    let elicitation_mode = acp::ElicitationMode::Form(acp::ElicitationFormMode::new(
+        acp::ElicitationScope::Session(session_scope),
+        schema,
+    ));
+    let request = acp::CreateElicitationRequest::new(elicitation_mode, message);
+    let agent_request = acp::AgentRequest::CreateElicitationRequest(request);
+
+    info!(
+        interrogative_id = %interrogative_id,
+        "Sending goal_proposal as native elicitation/create"
+    );
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+    let payload_clone = payload.clone();
+    let session_id_clone = acp::SessionId::new(session_id.to_string());
+    let conn_clone = conn.clone();
+
+    let sent = conn.send_request(agent_request);
+    sent.on_receiving_result(async move |result| {
+        match result {
+            Ok(response) => {
+                let response_json: serde_json::Value = serde_json::from_str(
+                    &serde_json::to_string(&response).unwrap_or_default(),
+                )
+                .unwrap_or_default();
+
+                let action = response_json
+                    .get("action")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+
+                match action {
+                    "accept" => {
+                        // Extract the selected option from the form content.
+                        let content = response_json
+                            .get("content")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+                        let selected = content
+                            .get(events::GOAL_PROPOSAL_QUESTION_ID)
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+
+                        let body = events::build_goal_proposal_response(selected.as_deref());
+
+                        info!(
+                            interrogative_id = %interrogative_id,
+                            accepted = ?body.get("accepted"),
+                            "goal_proposal elicitation response"
+                        );
+
+                        if let Err(e) = post_interrogative_response(
+                            &base_url,
+                            &bearer_token,
+                            &interrogative_id,
+                            &body,
+                        )
+                        .await
+                        {
+                            error!(error = %e, "Failed to respond to goal_proposal on daemon");
+                        }
+                    }
+                    _ => {
+                        info!(
+                            interrogative_id = %interrogative_id,
+                            action = action,
+                            "User declined/cancelled goal_proposal elicitation; sending text fallback then cancelling"
+                        );
+                        send_question_text_fallback(&conn_clone, &session_id_clone, &payload_clone);
+                        let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id)
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    interrogative_id = %interrogative_id,
+                    "Goal proposal elicitation failed; sending text fallback then cancelling"
+                );
+                send_question_text_fallback(&conn_clone, &session_id_clone, &payload_clone);
+                let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id).await;
+            }
         }
 
         Ok(())
