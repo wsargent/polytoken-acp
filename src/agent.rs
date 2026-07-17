@@ -2235,6 +2235,7 @@ enum ConsumeOutcome {
 }
 
 /// Connect to SSE stream and consume events until the turn ends or an error occurs.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_consume(
     events_url: &str,
     bearer_token: &str,
@@ -2955,11 +2956,11 @@ async fn handle_ask_user_question_elicitation(
                             }
                         }
                     }
-                    "decline" | "cancel" | _ => {
+                    _ => {
                         info!(
                             interrogative_id = %interrogative_id,
                             action = action,
-                            "User declined/cancelled elicitation; sending text fallback then cancelling"
+                            "User declined/cancelled elicitation (action: {}); sending text fallback then cancelling", action
                         );
                         // Even on decline, show the question as text so the
                         // user can still answer naturally.
@@ -3483,7 +3484,7 @@ fn render_ask_user_question_text(payload: &events::AskUserQuestionPayload) -> St
             buf.push_str("\n\n");
         }
         buf.push_str(&q.question);
-        buf.push_str("\n");
+        buf.push('\n');
 
         if !q.options.is_empty() {
             buf.push('\n');
@@ -3491,7 +3492,7 @@ fn render_ask_user_question_text(payload: &events::AskUserQuestionPayload) -> St
                 let letter = (b'a' + oi as u8) as char;
                 buf.push_str(&format!("{}) {} ", letter, opt.label));
             }
-            buf.push_str("\n");
+            buf.push('\n');
         }
 
         // Blank line between multiple questions
