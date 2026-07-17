@@ -35,6 +35,12 @@ struct AgentState {
     /// `handle_cancel` triggers these to proactively unblock the `SseConsumer`
     /// even when the daemon never emits a `TurnCancelled` SSE event.
     cancel_tokens: HashMap<String, CancellationToken>,
+    /// Client capabilities captured from the ACP `initialize` handshake.
+    /// `None` until `initialize` is received; `Some(capabilities)` after.
+    /// Used to decide whether to use native `session/elicitation` for
+    /// `ask_user_question` (when the client advertises form support) or
+    /// fall back to the ext-method + text fallback path.
+    client_capabilities: Option<acp::ClientCapabilities>,
 }
 
 /// A queued prompt awaiting execution by the per-session processor task.
@@ -47,6 +53,8 @@ struct PromptQueueItem {
     cwd: std::path::PathBuf,
     responder: agent_client_protocol::Responder<acp::PromptResponse>,
     conn: ConnectionTo<Client>,
+    /// Whether the client advertised form-based elicitation support.
+    supports_elicitation: bool,
 }
 
 impl AgentState {
@@ -55,6 +63,7 @@ impl AgentState {
             sessions: HashMap::new(),
             prompt_queues: HashMap::new(),
             cancel_tokens: HashMap::new(),
+            client_capabilities: None,
         }
     }
 
@@ -81,41 +90,52 @@ pub async fn run() {
         .name("polytoken")
         // initialize
         .on_receive_request(
-            async |_req: acp::InitializeRequest, responder, _cx| {
-                info!("ACP initialize from client");
-                let mut ext_meta = serde_json::Map::new();
-                ext_meta.insert(
-                    "polytoken".to_string(),
-                    serde_json::json!({
-                        "ask_user_question": true,
-                        "system_reminder": true,
-                        "subagent_started": true,
-                        "subagent_completed": true,
-                        "job_promoted": true,
-                        "job_completed": true,
-                        "job_expiring": true,
-                        "job_cancelled": true,
-                        "job_updated": true,
-                    }),
-                );
-                let caps = acp::AgentCapabilities::new()
-                    .load_session(true)
-                    .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
-                    .mcp_capabilities(acp::McpCapabilities::new())
-                    .session_capabilities(
-                        acp::SessionCapabilities::new()
-                            .list(acp::SessionListCapabilities::new())
-                            .resume(acp::SessionResumeCapabilities::new())
-                            .close(acp::SessionCloseCapabilities::new()),
-                    )
-                    .meta(ext_meta);
-                let resp = acp::InitializeResponse::new(_req.protocol_version)
-                    .agent_capabilities(caps)
-                    .agent_info(
-                        acp::Implementation::new("polytoken", env!("CARGO_PKG_VERSION"))
-                            .title("Polytoken"),
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::InitializeRequest, responder, _cx| {
+                    info!("ACP initialize from client");
+
+                    // Capture client capabilities for later use (elicitation
+                    // negotiation, ext-method support checks, etc.).
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.client_capabilities = Some(req.client_capabilities.clone());
+                    }
+
+                    let mut ext_meta = serde_json::Map::new();
+                    ext_meta.insert(
+                        "polytoken".to_string(),
+                        serde_json::json!({
+                            "ask_user_question": true,
+                            "system_reminder": true,
+                            "subagent_started": true,
+                            "subagent_completed": true,
+                            "job_promoted": true,
+                            "job_completed": true,
+                            "job_expiring": true,
+                            "job_cancelled": true,
+                            "job_updated": true,
+                        }),
                     );
-                responder.respond(resp)
+                    let caps = acp::AgentCapabilities::new()
+                        .load_session(true)
+                        .prompt_capabilities(acp::PromptCapabilities::new().embedded_context(true))
+                        .mcp_capabilities(acp::McpCapabilities::new())
+                        .session_capabilities(
+                            acp::SessionCapabilities::new()
+                                .list(acp::SessionListCapabilities::new())
+                                .resume(acp::SessionResumeCapabilities::new())
+                                .close(acp::SessionCloseCapabilities::new()),
+                        )
+                        .meta(ext_meta);
+                    let resp = acp::InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(caps)
+                        .agent_info(
+                            acp::Implementation::new("polytoken", env!("CARGO_PKG_VERSION"))
+                                .title("Polytoken"),
+                        );
+                    responder.respond(resp)
+                }
             },
             on_receive_request!(),
         )
@@ -855,7 +875,7 @@ async fn handle_prompt(
     );
 
     // Collect connection info and prompt-queue sender without holding lock across await
-    let (events_url, bearer_token, base_url, cwd, queue_sender) = {
+    let (events_url, bearer_token, base_url, cwd, queue_sender, supports_elicitation) = {
         let sessions = state.lock().unwrap();
         let daemon = match sessions.sessions.get(&session_id) {
             Some(d) => d,
@@ -869,12 +889,17 @@ async fn handle_prompt(
             }
         };
         let sender = sessions.prompt_queues.get(&session_id).cloned();
+        // Check whether the client advertised form-based elicitation support
+        // in its initialize capabilities. If so, ask_user_question will be
+        // sent as a native session/elicitation request (clickable form).
+        let supports_elicitation = client_supports_elicitation(&sessions.client_capabilities);
         (
             daemon.events_url(),
             daemon.bearer_token().to_string(),
             daemon.base_url().to_string(),
             daemon.cwd().to_path_buf(),
             sender,
+            supports_elicitation,
         )
     };
 
@@ -905,6 +930,7 @@ async fn handle_prompt(
         cwd,
         responder,
         conn: cx.clone(),
+        supports_elicitation,
     };
 
     match queue_sender.try_send(item) {
@@ -1020,6 +1046,7 @@ async fn run_prompt_turn(item: PromptQueueItem, cancel_token: CancellationToken)
         base_url: item.base_url,
         cwd: item.cwd,
         responder: item.responder,
+        supports_elicitation: item.supports_elicitation,
     };
 
     // Await the SSE consumer to completion (do NOT spawn — the processor
@@ -2083,6 +2110,11 @@ struct SseConsumer {
     base_url: String,
     cwd: std::path::PathBuf,
     responder: agent_client_protocol::Responder<acp::PromptResponse>,
+    /// Whether the client advertised form-based elicitation support in its
+    /// `initialize` capabilities. When `true`, `ask_user_question` is sent
+    /// as a native ACP `session/elicitation` request (clickable form).
+    /// When `false`, falls back to the ext method + text fallback path.
+    supports_elicitation: bool,
 }
 
 impl SseConsumer {
@@ -2100,6 +2132,7 @@ impl SseConsumer {
         let bearer_token = self.bearer_token;
         let base_url = self.base_url;
         let cwd = self.cwd;
+        let supports_elicitation = self.supports_elicitation;
         let mut responder = Some(self.responder);
 
         loop {
@@ -2117,6 +2150,7 @@ impl SseConsumer {
                     &session_id,
                     &cwd,
                     &conn,
+                    supports_elicitation,
                 ) => result,
                 _ = cancel_token.cancelled() => {
                     info!(
@@ -2209,6 +2243,7 @@ async fn connect_and_consume(
     session_id: &str,
     cwd: &std::path::Path,
     conn: &ConnectionTo<Client>,
+    supports_elicitation: bool,
 ) -> ConsumeOutcome {
     let client = reqwest::Client::new();
     let response = client
@@ -2259,6 +2294,7 @@ async fn connect_and_consume(
                 cwd,
                 &mut cached_facets,
                 conn,
+                supports_elicitation,
             )
             .await
             {
@@ -2285,6 +2321,7 @@ async fn process_sse_event(
     cwd: &std::path::Path,
     cached_facets: &mut Option<Vec<String>>,
     conn: &ConnectionTo<Client>,
+    supports_elicitation: bool,
 ) -> ConsumeOutcome {
     let event = match events::parse_sse_event(data) {
         Some(e) => e,
@@ -2378,8 +2415,16 @@ async fn process_sse_event(
             interrogative_id,
             payload,
         } => {
-            handle_ask_user_question(conn, &interrogative_id, &payload, base_url, bearer_token)
-                .await;
+            handle_ask_user_question(
+                conn,
+                &interrogative_id,
+                &payload,
+                session_id,
+                base_url,
+                bearer_token,
+                supports_elicitation,
+            )
+            .await;
             ConsumeOutcome::Continue
         }
         EventTranslation::PlanHandoff {
@@ -2748,17 +2793,285 @@ fn send_ext_notification(conn: &ConnectionTo<Client>, method: &str, params: &ser
     let _ = conn.send_request(ext_notif);
 }
 
+/// Check whether the client's `initialize` capabilities advertise form-based
+/// elicitation support. Returns `true` only when the client can render a
+/// `session/elicitation` form (single-select enum, multi-select, etc.).
+fn client_supports_elicitation(caps: &Option<acp::ClientCapabilities>) -> bool {
+    caps.as_ref()
+        .and_then(|c| c.elicitation.as_ref())
+        .and_then(|e| e.form.as_ref())
+        .is_some()
+}
+
+/// Map a single Polytoken `ask_user_question` item to an ACP elicitation
+/// `StringPropertySchema`. Single-select becomes a titled enum (`oneOf`),
+/// multi-select becomes an array property, and free-text becomes a plain
+/// string. This is the schema the client renders as a form.
+fn build_elicitation_schema_for_question(
+    q: &events::AskUserQuestionItem,
+) -> (String, acp::ElicitationPropertySchema, bool) {
+    use acp::{ElicitationPropertySchema, MultiSelectPropertySchema, StringPropertySchema};
+    let field_name = q.id.clone();
+
+    match q.mode {
+        events::AskUserQuestionMode::SingleSelect => {
+            // Build titled enum options: option.id is the const value,
+            // option.label is the human-readable title.
+            let enum_options: Vec<acp::EnumOption> = q
+                .options
+                .iter()
+                .map(|opt| acp::EnumOption::new(opt.id.clone(), opt.label.clone()))
+                .collect();
+            let schema = StringPropertySchema::new().one_of(enum_options);
+            (field_name, ElicitationPropertySchema::String(schema), true)
+        }
+        events::AskUserQuestionMode::MultiSelect => {
+            let enum_options: Vec<acp::EnumOption> = q
+                .options
+                .iter()
+                .map(|opt| acp::EnumOption::new(opt.id.clone(), opt.label.clone()))
+                .collect();
+            let schema = MultiSelectPropertySchema::titled(enum_options);
+            (field_name, ElicitationPropertySchema::Array(schema), true)
+        }
+        events::AskUserQuestionMode::Text => {
+            let schema = StringPropertySchema::new();
+            (field_name, ElicitationPropertySchema::String(schema), true)
+        }
+    }
+}
+
+/// Send `ask_user_question` as a native ACP `session/elicitation` request.
+/// The client renders a form with clickable options (when supported) and
+/// returns the selected values. If the user declines or cancels, the
+/// interrogative is cancelled on the daemon.
+async fn handle_ask_user_question_elicitation(
+    conn: &ConnectionTo<Client>,
+    interrogative_id: &str,
+    payload: &AskUserQuestionPayload,
+    session_id: &str,
+    base_url: &str,
+    bearer_token: &str,
+) {
+    // Build the elicitation message from all questions. When there's one
+    // question, the message is the question text (plus options rendered as
+    // the form). When there are multiple, we number them.
+    let message = if payload.questions.len() == 1 {
+        let q = &payload.questions[0];
+        // Include context as part of the message so the user has enough
+        // background to answer.
+        match &q.context {
+            Some(ctx) => format!("{}\n\n{}", ctx, q.question),
+            None => q.question.clone(),
+        }
+    } else {
+        let mut buf = String::new();
+        for (i, q) in payload.questions.iter().enumerate() {
+            if let Some(ctx) = &q.context {
+                buf.push_str(ctx);
+                buf.push_str("\n\n");
+            }
+            buf.push_str(&format!("{}. {}\n", i + 1, q.question));
+        }
+        buf
+    };
+
+    // Build the form schema: one property per question.
+    let mut schema = acp::ElicitationSchema::new();
+    for q in &payload.questions {
+        let (name, prop_schema, required) = build_elicitation_schema_for_question(q);
+        schema = schema.property(name, prop_schema, required);
+    }
+
+    let session_scope =
+        acp::ElicitationSessionScope::new(acp::SessionId::new(session_id.to_string()));
+    let elicitation_mode = acp::ElicitationMode::Form(acp::ElicitationFormMode::new(
+        acp::ElicitationScope::Session(session_scope),
+        schema,
+    ));
+    let request = acp::CreateElicitationRequest::new(elicitation_mode, message);
+
+    let agent_request = acp::AgentRequest::CreateElicitationRequest(request);
+
+    info!(
+        interrogative_id = %interrogative_id,
+        "Sending ask_user_question as native elicitation/create"
+    );
+
+    let base_url = base_url.to_string();
+    let bearer_token = bearer_token.to_string();
+    let interrogative_id = interrogative_id.to_string();
+    let payload_clone = payload.clone();
+    let session_id_clone = acp::SessionId::new(session_id.to_string());
+    let conn_clone = conn.clone();
+
+    let sent = conn.send_request(agent_request);
+    sent.on_receiving_result(async move |result| {
+        match result {
+            Ok(response) => {
+                // ElicitationResponse has an `action` field: Accept/Decline/Cancel
+                let response_json: serde_json::Value = serde_json::from_str(
+                    &serde_json::to_string(&response).unwrap_or_default(),
+                )
+                .unwrap_or_default();
+
+                let action = response_json
+                    .get("action")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+
+                match action {
+                    "accept" => {
+                        // Extract the content map and convert to answer replies.
+                        let content = response_json
+                            .get("content")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+                        let answers = elicitation_content_to_answers(&content, &payload_clone);
+
+                        if answers.is_empty() {
+                            warn!(
+                                interrogative_id = %interrogative_id,
+                                "Elicitation accepted but no answers; cancelling"
+                            );
+                            let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id)
+                                .await;
+                        } else {
+                            info!(
+                                interrogative_id = %interrogative_id,
+                                answer_count = answers.len(),
+                                "Answers received from elicitation"
+                            );
+                            if let Err(e) = respond_ask_user_question(
+                                &base_url,
+                                &bearer_token,
+                                &interrogative_id,
+                                &answers,
+                            )
+                            .await
+                            {
+                                error!(error = %e, "Failed to respond to ask_user_question on daemon");
+                            }
+                        }
+                    }
+                    "decline" | "cancel" | _ => {
+                        info!(
+                            interrogative_id = %interrogative_id,
+                            action = action,
+                            "User declined/cancelled elicitation; sending text fallback then cancelling"
+                        );
+                        // Even on decline, show the question as text so the
+                        // user can still answer naturally.
+                        send_question_text_fallback(&conn_clone, &session_id_clone, &payload_clone);
+                        let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id)
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    interrogative_id = %interrogative_id,
+                    "Elicitation request failed; sending text fallback then cancelling"
+                );
+                send_question_text_fallback(&conn_clone, &session_id_clone, &payload_clone);
+                let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id).await;
+            }
+        }
+
+        Ok(())
+    })
+    .expect("on_receiving_result failed");
+}
+
+/// Convert an elicitation response content map (property name → value) into
+/// the daemon's `ask_user_question_answers` format.
+///
+/// The daemon expects each answer as:
+/// `{ "question_id": "...", "selected_option_ids": [...], "free_text": null }`
+fn elicitation_content_to_answers(
+    content: &serde_json::Value,
+    payload: &events::AskUserQuestionPayload,
+) -> Vec<serde_json::Value> {
+    let obj = match content.as_object() {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    let mut answers = Vec::new();
+
+    for q in &payload.questions {
+        if let Some(value) = obj.get(&q.id) {
+            // For single_select: the value is the selected option ID (string).
+            // For multi_select: the value is an array of option IDs.
+            // For text: the value is the typed string.
+            let answer = match value {
+                serde_json::Value::String(s) => match q.mode {
+                    events::AskUserQuestionMode::Text => {
+                        serde_json::json!({
+                            "question_id": q.id,
+                            "selected_option_ids": [],
+                            "free_text": s
+                        })
+                    }
+                    _ => {
+                        serde_json::json!({
+                            "question_id": q.id,
+                            "selected_option_ids": [s],
+                            "free_text": null
+                        })
+                    }
+                },
+                serde_json::Value::Array(arr) => {
+                    let ids: Vec<String> = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
+                    serde_json::json!({
+                        "question_id": q.id,
+                        "selected_option_ids": ids,
+                        "free_text": null
+                    })
+                }
+                _ => {
+                    serde_json::json!({
+                        "question_id": q.id,
+                        "selected_option_ids": [],
+                        "free_text": value.to_string()
+                    })
+                }
+            };
+            answers.push(answer);
+        }
+    }
+
+    answers
+}
+
 /// Forward an ask_user_question to the ACP client via ext_method and relay answers.
+///
+/// If the client doesn't support the `_polytoken/ask_user_question` ext method
+/// (or returns no answers), the question is rendered as visible text via an
+/// `AgentMessageChunk` notification so the user can still see and answer it
+/// before the interrogative is cancelled.
+///
+/// If the client advertised form-based elicitation support during the ACP
+/// `initialize` handshake, a native `session/elicitation` request is sent
+/// instead (clickable form with single-select enum options).
 async fn handle_ask_user_question(
     conn: &ConnectionTo<Client>,
     interrogative_id: &str,
     payload: &AskUserQuestionPayload,
+    session_id: &str,
     base_url: &str,
     bearer_token: &str,
+    supports_elicitation: bool,
 ) {
     info!(
         interrogative_id = %interrogative_id,
         question_count = payload.questions.len(),
+        supports_elicitation = supports_elicitation,
         "Forwarding ask_user_question to ACP client"
     );
 
@@ -2766,8 +3079,28 @@ async fn handle_ask_user_question(
         target: "polytoken_acp::conv",
         interrogative_id = %interrogative_id,
         question_count = payload.questions.len(),
+        supports_elicitation = supports_elicitation,
         "ask_user_question"
     );
+
+    // If the client advertised form-based elicitation support during
+    // initialize, use the standardized `session/elicitation` request.
+    // This renders as a proper form with clickable options (single-select
+    // enum / multi-select) in capable clients — better UX than text.
+    if supports_elicitation {
+        handle_ask_user_question_elicitation(
+            conn,
+            interrogative_id,
+            payload,
+            session_id,
+            base_url,
+            bearer_token,
+        )
+        .await;
+        return;
+    }
+
+    // Otherwise, fall back to the _polytoken/ask_user_question ext method,
 
     let request_json = serde_json::json!({
         "interrogative_id": interrogative_id,
@@ -2791,6 +3124,9 @@ async fn handle_ask_user_question(
     let base_url = base_url.to_string();
     let bearer_token = bearer_token.to_string();
     let interrogative_id = interrogative_id.to_string();
+    let session_id = acp::SessionId::new(session_id.to_string());
+    let conn_clone = conn.clone();
+    let payload_clone = payload.clone();
 
     let sent = conn.send_request(ext_request);
     sent.on_receiving_result(async move |result| {
@@ -2803,6 +3139,7 @@ async fn handle_ask_user_question(
                         interrogative_id = %interrogative_id,
                         "No answers from ACP client; cancelling interrogative"
                     );
+                    send_question_text_fallback(&conn_clone, &session_id, &payload_clone);
                     let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id).await;
                     return Ok(());
                 }
@@ -2826,6 +3163,7 @@ async fn handle_ask_user_question(
                     interrogative_id = %interrogative_id,
                     "ACP client does not support ask_user_question or request failed; cancelling"
                 );
+                send_question_text_fallback(&conn_clone, &session_id, &payload_clone);
                 let _ = cancel_interrogative(&base_url, &bearer_token, &interrogative_id).await;
             }
         }
@@ -3123,6 +3461,68 @@ async fn respond_interrogative_generic(
         warn!(status = %resp.status(), "Generic interrogative response failed");
     }
     Ok(())
+}
+
+/// Render an `ask_user_question` payload as human-readable text so the user
+/// can see and answer the question even when the ACP client doesn't support
+/// the `_polytoken/ask_user_question` overlay (ext-method fallback).
+fn render_ask_user_question_text(payload: &events::AskUserQuestionPayload) -> String {
+    let mut buf = String::new();
+    for (qi, q) in payload.questions.iter().enumerate() {
+        if payload.questions.len() > 1 {
+            buf.push_str(&format!(
+                "**Question {} of {}**\n\n",
+                qi + 1,
+                payload.questions.len()
+            ));
+        }
+        // Context (explainer) — trimmed to keep it concise but included
+        // because the user may not have the agent's reasoning in view.
+        if let Some(ctx) = &q.context {
+            buf.push_str(ctx);
+            buf.push_str("\n\n");
+        }
+        buf.push_str(&q.question);
+        buf.push_str("\n");
+
+        if !q.options.is_empty() {
+            buf.push('\n');
+            for (oi, opt) in q.options.iter().enumerate() {
+                let letter = (b'a' + oi as u8) as char;
+                buf.push_str(&format!("{}) {} ", letter, opt.label));
+            }
+            buf.push_str("\n");
+        }
+
+        // Blank line between multiple questions
+        if qi + 1 < payload.questions.len() {
+            buf.push('\n');
+        }
+    }
+    buf
+}
+
+/// Send the question payload as visible text via an `AgentMessageChunk`
+/// notification. Used as a fallback when the `_polytoken/ask_user_question`
+/// ext method fails or returns no answers — the user sees the question and
+/// can respond naturally instead of facing a silent cancellation.
+fn send_question_text_fallback(
+    conn: &ConnectionTo<Client>,
+    session_id: &acp::SessionId,
+    payload: &events::AskUserQuestionPayload,
+) {
+    let text = render_ask_user_question_text(payload);
+    let content_block: acp::ContentBlock = text.into();
+    let chunk = acp::ContentChunk::new(content_block);
+    let notification = acp::SessionNotification::new(
+        session_id.clone(),
+        acp::SessionUpdate::AgentMessageChunk(chunk),
+    );
+    if let Err(e) = conn.send_notification(notification) {
+        error!(error = %e, "Failed to send ask_user_question text fallback");
+    } else {
+        info!("ask_user_question ext-method fallback: sent question as visible text");
+    }
 }
 
 /// Parse the ext_method response from the ACP client into answer replies.
