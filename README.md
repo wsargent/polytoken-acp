@@ -1,6 +1,8 @@
 # polytoken-acp
 
-An [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) server shim for the [Polytoken](https://github.com/wsargent/polytoken) daemon.
+An [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) server shim for the [Polytoken](https://docs.polytoken.dev/introduction/) daemon.
+
+> I have to be clear whenever this comes up: 0% guarantee on any API stability for things like this. > the polytoken API is a private surface until 1.0
 
 ## What It Does
 
